@@ -28,6 +28,7 @@ class Config:
     min_delta: float = 0.005              # dev F1 must beat the best by this much
     max_class_drop: float = 0.10          # reject if any class F1 falls more than this
     max_bad_rounds: int = 2               # stop after N consecutive rejections
+    max_rounds: int = 8                   # hard cap on rounds, whatever the pipeline file asks for
     confidence_threshold: float = 0.9     # only for the "no verifier" ablation
 
     # --- Level 1/2 evolution ---------------------------------------------

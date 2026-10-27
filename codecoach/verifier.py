@@ -9,9 +9,11 @@ stops self-training from confirming its own mistakes.
 """
 from dataclasses import dataclass
 
-from codecoach.misconceptions import repair
-from codecoach.problems import Problem
+from codecoach.generator import PoolSample, normalized_problem
+from codecoach.misconceptions import LABELS, repair
+from codecoach.problems import BY_NAME, Problem
 from codecoach.sandbox import DEFAULT_TIMEOUT_S, run_tests_many
+from codecoach.utils import sha256_text
 
 
 @dataclass(frozen=True)
@@ -37,3 +39,23 @@ def verify(buggy_source: str, predicted_label: str, problem: Problem,
     if all(r.reason == "timeout" for r in results):
         return Verdict(False, "timeout")
     return Verdict(False, "tests_still_fail")
+
+
+def verdict_key(code: str, label: str) -> str:
+    """Lookup key of one (program, claimed label) question."""
+    return f"{sha256_text(code)[:16]}:{label}"
+
+
+def build_verdict_table(pool: list[PoolSample]) -> dict[str, str]:
+    """Answer EVERY (program, label) question once: key -> verdict reason ("verified" if accepted).
+
+    The verifier is fixed and deterministic and does not depend on any model, so its answers can be
+    computed once and looked up. Each pipeline version evaluated later then costs milliseconds
+    instead of thousands of sandbox runs. The lookup returns exactly what verify() would.
+    """
+    table = {}
+    for item in pool:
+        problem = normalized_problem(BY_NAME[item.problem])
+        for label in LABELS:
+            table[verdict_key(item.code, label)] = verify(item.code, label, problem).reason
+    return table

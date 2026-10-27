@@ -631,4 +631,141 @@ every style variant still passes the problem's tests; style rewrites really add 
 
 ---
 
-<!-- Next entry: Step 6: self-training (Level 0) -->
+## Step 6: Level 0, verified self-training (`codecoach/self_training.py` and friends)
+
+Files: `self_training.py` (110 lines), `teacher.py`, `evaluation.py`, `feature_blocks.py`, `evolvable/pipeline.py`
+(**v0**), `verifier.py` (+ verdict table), `tests/test_self_training.py`; `max_rounds` in `config.py`.
+`teacher.py` is a helper module not named in the spec: it holds the shared mechanics so that
+`self_training.py` stays short and readable.
+
+### 6.1 What Level 0 does, in one picture
+
+```
+seed (30 labeled) --> train teacher v0
+repeat up to N rounds:
+    teacher diagnoses unlabeled pool programs
+    verifier keeps only diagnoses where a matching repair passes the hidden tests
+    train a COPY on seed + verified examples (curated)
+    GATE on dev: better by min_delta and no class collapsed?  yes -> promote the copy
+                                                               no  -> rollback (keep old teacher)
+    stop after 2 rejected rounds in a row
+```
+It changes only the *weights*. The code that defines the pipeline does not change here; that is Level 1.
+
+### 6.2 The gate, and why it has two conditions
+
+- **Decision**: accept a candidate only if `dev macro-F1 >= best + min_delta` **and** no class F1 fell by more
+  than `max_class_drop` (0.10).
+- **Why (intuition)**: self-training has a known failure: the model reinforces its own mistakes (confirmation
+  bias). The gate is the circuit breaker. The class-drop rule exists because an *average* can rise while one
+  class is sacrificed, which for a tutor means some students get systematically wrong feedback.
+- **Evaluator might ask**: *"What stops error amplification?"* Two layers: the verifier decides what enters
+  training, and the dev gate decides whether the result is kept at all.
+
+### 6.3 Rollback is just "do not replace the old object"
+
+- **Decision**: the candidate is trained as a separate model; `teacher` is reassigned only on acceptance.
+- **Why (intuition)**: rollback needs no undo logic because the old teacher was never touched. The simplest
+  safe design is one where failure leaves everything as it was. There is a test for it
+  (`test_impossible_gate_means_rollback_and_early_stop`: nothing promoted, final dev equals initial dev).
+
+### 6.4 Retrain from scratch each round, on seed + all verified so far
+
+- **Decision**: every candidate is a fresh network (not the previous teacher fine-tuned).
+- **Alternative**: keep training the same network round after round.
+- **Why (intuition)**: continuing to train a model on data it produced compounds its errors. A fresh network
+  on the verified set is a clean test: "does this dataset teach something better?" It also makes rounds
+  independent and reproducible (seed + round number).
+
+### 6.5 The pipeline may only make the gate STRICTER
+
+- **Decision**: `effective_min_delta = max(config.min_delta, pipe.MIN_DELTA)`.
+- **Why (intuition)**: `MIN_DELTA` lives in the editable file so Level 1 can tune it. If an edit could set it to
+  `-1`, every round would be accepted and the gate would protect nothing. This is **reward hacking by editing
+  the rules**. Letting the file raise the bar but never lower it keeps the search space useful and the guarantee
+  intact. Same idea: `max_class_drop` and `max_rounds` come only from `config.py`, which the system cannot edit.
+
+### 6.6 Hidden labels are used for logging only, and a test proves it
+
+- **Decision**: the loop reads `.code` of pool items. `hidden_label` is read in exactly one place, to compute
+  `precision` and `raw_accuracy` for the log.
+- **Proof, not promise**: `test_loop_never_reads_hidden_labels` replaces every hidden label with `"SCRAMBLED"`
+  and checks that all decisions and final scores are identical; only the two logged statistics may differ.
+
+### 6.7 Precomputed verdict table (speed without changing results)
+
+- **Decision**: script 01 asks the verifier every (program, label) question once (172 x 5) and saves
+  `data/generated/verdicts.json` (50 s, one time). The loop looks answers up, and falls back to a live
+  `verify()` call on a miss.
+- **Why (intuition)**: the verifier does not depend on any model, so its answers are fixed facts. Later, Level 1
+  evaluates dozens of pipeline versions, each in its own process, and the in-memory sandbox cache is not
+  shared across processes. Without the table each evaluation would redo thousands of sandbox runs.
+  With it, a whole Level 0 run takes about 7.5 s.
+- **Side benefit (real numbers)**: on the 172 pool programs the verifier accepts the **true label 172/172** and a
+  **wrong label 4/688 (0.6%)**.
+- **Important for Step 7**: the evaluator must only *read* `data/generated/`. Tamper detection hashes `data/`
+  before and after every evaluation; a write there would look like an attack.
+
+### 6.8 `pipeline.py` v0: a deliberately plain baseline
+
+- Char 2-4-gram TF-IDF + 3 structural features (`count_comparisons`, `count_range_calls`,
+  `count_subscripts`) -> MLP 256-128, dropout 0.2, Adam 1e-3, 30 epochs. `PER_CLASS_CAP = 30`.
+- These were set once, before any result, and **not tuned**. The point of Level 1 is to see whether the system
+  can beat a baseline we did not polish. Tuning v0 until it looked good would make any later gain smaller and
+  harder to defend.
+- Features go through `sign(x) * log1p(|x|)` so counts live on the same scale as TF-IDF values (0 to 1).
+- Whitelisted building blocks (`feature_blocks.py`) are a fixed menu of 8 functions. An edit can only combine
+  tools we wrote and tested.
+
+### 6.9 REAL RESULT (seed 0, default settings, one run)
+
+| Round | Pool left | Verified | Rejected | Precision of verified | Teacher's raw accuracy | Dev F1 | Decision |
+|---|---|---|---|---|---|---|---|
+| (v0, seed only) | | | | | | 0.211 | |
+| 1 | 172 | 61 | 111 | 1.00 | 0.35 | 0.303 | accepted |
+| 2 | 111 | 14 | 97 | 1.00 | 0.13 | 0.322 | accepted |
+| 3 | 97 | 21 | 76 | 1.00 | 0.22 | 0.394 | accepted |
+| 4 | 76 | 11 | 65 | 1.00 | 0.14 | 0.337 | **rejected (no_improvement)** |
+
+Final dev macro-F1 **0.211 -> 0.394** (reproducible: a second run gave identical numbers).
+
+| Class | Start | Final |
+|---|---|---|
+| OFF_BY_ONE_RANGE | 0.22 | 0.57 |
+| WRONG_INDEX | 0.42 | 0.52 |
+| COMPARISON_BOUNDARY | **0.00** | **0.00** |
+| LOGIC_OPERATOR | 0.42 | 0.88 |
+| WRONG_INITIAL_VALUE | **0.00** | **0.00** |
+
+What this shows:
+- **The verifier is doing the work.** The teacher was wrong 65-87% of the time on the pool, yet everything the
+  verifier let through was correct (96 of 96). Naive self-training would have trained on mostly wrong labels.
+- **The gate worked as designed**: round 4 got worse on dev and was rolled back.
+- **A blind spot (important)**: two classes stay at **0.00**. Self-training can only learn from diagnoses the
+  teacher *makes*, and a teacher that never predicts `COMPARISON_BOUNDARY` correctly never produces verified
+  examples of it. The seed has just 3 examples of each of those two classes. This is the "rich get richer"
+  weakness of self-training and a natural target for Level 1 (e.g. better structural features, or a curation
+  that rebalances). We do not fix it by hand.
+- Verified counts shrink each round (61, 14, 21, 11): easy cases are absorbed first, and the remaining
+  pool is harder.
+
+### 6.10 Caveats that must go in the report
+
+- **One seed, one run.** No error bars yet.
+- **Dev is used twice**: it drives the Level 0 gate *and* it is the number we report here. That makes
+  0.394 optimistic. The honest numbers are meta_dev and test, which nothing has been selected on.
+- **Small F1 steps are noise-sized** (6 to 19 samples per class): a +0.02 move between rounds is not evidence.
+- The pool is 172 programs; `POOL_PER_ROUND = 300` therefore means "the whole pool".
+- A bug in my own printout (labels cut to 8 characters merged two classes) briefly hid the zero-F1 finding;
+  caught by re-running with full names. Worth remembering: check how results are *displayed*, too.
+
+### 6.11 Tests (9 new, 33 total, 40 s)
+
+Gate accepts clear gains, rejects "no improvement" and "tiny gain", rejects a class collapse even when the
+average rises; the pipeline cannot loosen the gate; confidence-only ablation works; curation dedups and caps;
+feature blocks count what they say (and survive unparseable code); rollback + early stop; hidden labels never
+influence decisions.
+
+---
+
+<!-- Next entry: Step 7: Level 1, code editor / safety / archive / evaluator / evolve loop -->
