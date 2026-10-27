@@ -1,0 +1,10 @@
+numpy
+scikit-learn
+torch
+matplotlib
+pandas
+streamlit
+plotly
+pytest
+# Optional: only for the LLM proposer (codecoach/llm_proposer.py)
+# anthropic

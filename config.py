@@ -1,0 +1,58 @@
+"""All project settings in ONE place.
+
+Why: every budget, seed and gate threshold lives here so that (a) experiments are
+reproducible and (b) the system's own edits (evolvable/*.py) can never change them.
+`--quick` mode shrinks the budgets so the whole pipeline runs in ~3 minutes.
+"""
+from dataclasses import dataclass, replace
+
+
+@dataclass(frozen=True)  # frozen = settings cannot be mutated by accident at runtime
+class Config:
+    # --- reproducibility -------------------------------------------------
+    seed: int = 0
+    distill_seeds: tuple = (0, 1, 2)      # 3 seeds for the distillation comparison
+
+    # --- data ------------------------------------------------------------
+    seed_fraction: float = 0.15           # share of train problems' samples that are labeled
+    variants_per_problem: int = 12        # buggy variants generated per problem and class
+
+    # --- Level 0 gate (self-training) ------------------------------------
+    min_delta: float = 0.005              # dev F1 must beat the best by this much
+    max_class_drop: float = 0.10          # reject if any class F1 falls more than this
+    max_bad_rounds: int = 2               # stop after N consecutive rejections
+    confidence_threshold: float = 0.9     # only for the "no verifier" ablation
+
+    # --- Level 1/2 evolution ---------------------------------------------
+    generations: int = 20                 # G: pipeline edits tried
+    improver_every: int = 5               # K: every K gens the improver edits itself
+    improver_budget: int = 3              # B: child edits used to measure improver utility
+    patience: int = 10                    # stop after N gens with no improvement
+    eval_timeout_s: int = 300             # kill a candidate pipeline after this long
+    eval_memory_mb: int = 2048            # memory cap for a candidate pipeline
+    ablate_level2: bool = False           # True = Level 1 only (improver never edits itself)
+    ablate_verifier: bool = False         # True = confidence-threshold pseudo-labels instead
+
+    # --- distillation ----------------------------------------------------
+    temperature: float = 2.0              # T: softens teacher probabilities
+    alpha: float = 0.7                    # weight of hard-label CE; alpha=1 => no distillation
+    T_grid: tuple = (2.0, 4.0)
+    alpha_grid: tuple = (0.3, 0.7)
+    student_hidden: int = 16
+
+    # --- optional LLM proposer (off by default) --------------------------
+    use_llm: bool = False
+    max_llm_calls: int = 30
+
+    quick: bool = False
+
+
+def get_config(quick: bool = False) -> Config:
+    """Return the default config, or a much smaller one for `--quick` runs."""
+    cfg = Config()
+    if quick:
+        # Same logic, smaller budgets -> fast smoke test / live demo.
+        cfg = replace(cfg, quick=True, variants_per_problem=4, generations=6,
+                      improver_every=3, improver_budget=2, patience=4,
+                      eval_timeout_s=120)
+    return cfg
