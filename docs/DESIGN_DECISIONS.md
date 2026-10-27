@@ -234,4 +234,117 @@ Files: `codecoach/problems.py`, `tests/test_problems.py`. Result: 20 problems, 1
 
 ---
 
-<!-- Next entry: Step 3: misconceptions.py -->
+## Step 3: Misconceptions (`codecoach/misconceptions.py`)
+
+Files: `codecoach/misconceptions.py`, `tests/test_misconceptions.py` (164 lines + 4 tests).
+
+### 3.1 Edit the AST, never the text
+
+- **Decision**: parse with `ast`, change one node, convert back with `ast.unparse`.
+- **Alternative**: `source.replace("<", "<=")`.
+- **Why (intuition)**: text replacement does not know what code *is*. It would change a `<`
+  inside a string or comment, turn `<=` into `<==`, or hit `range` in a variable name. The AST
+  only contains real operators and calls, so every edit is a real, syntactically valid change.
+  It is the difference between find-and-replace in a text editor and a refactoring tool.
+- **Side effect to know**: `ast.unparse` rewrites formatting (quotes become `'`, comments
+  disappear). So we compare programs with `normalize()` (parse then unparse) and never raw text.
+
+### 3.2 An `Edit` = description + a function that applies it
+
+- **Decision**: every possible change is an `Edit(description, apply)`. `mutate` and `repair`
+  both do the same thing: list all edits, apply **each one separately to a fresh copy** of the
+  tree, unparse.
+- **Alternative**: apply all changes at once, or write one big function per class.
+- **Why (intuition)**: think of a list of "things you could change here". Applying one at a
+  time gives one bug per variant, and the description ("range stop -1 (line 3)") is a free
+  human-readable log for the web app and the failure analysis. A fresh tree per edit matters
+  because `apply` changes the tree in place: without that, edit 2 would stack on top of edit 1.
+
+### 3.3 One edit = one bug (single-cause variants)
+
+- **Decision**: each variant has exactly one injected bug, and each repair candidate changes
+  exactly one place.
+- **Why (intuition)**: the classifier's job is "which misconception caused this?". With two
+  bugs in one function the answer is ambiguous, and the repair would need to fix both at once.
+  Single-cause keeps the label well-defined. Real students often have several bugs, which is a
+  stated limitation.
+
+### 3.4 Repair is NOT the exact inverse, and that is the point
+
+- **Decision**: repair tries a *superset* of the fixes (for `range`: stop +-1 and start +-1;
+  for initial values: 6 standard values). It does not know which edit was injected.
+- **Why (intuition)**: at diagnosis time we only have the buggy code and a predicted label, not
+  the history. A real teacher would say "your loop bound looks wrong" and try the usual fixes.
+  The tests decide which, if any, works. If repair were a perfect undo, the verifier would be
+  cheating by knowing the answer.
+- **The test that proves coverage**: `test_every_mutation_can_be_undone_by_its_own_repair`
+  checks that for every bug we can inject, the original program is among the repair candidates.
+  If this failed, the verifier would reject *correct* diagnoses and we would not know why.
+
+### 3.5 Symmetric classes reuse one function for bug and fix
+
+- **Decision**: `WRONG_INDEX`, `COMPARISON_BOUNDARY` and `LOGIC_OPERATOR` use the same edit list
+  for `mutate` and `repair`. Flipping `<` to `<=` is its own undo; `and` -> `or` likewise.
+- **Why (intuition)**: less code and no chance that the bug operator and the fix operator drift
+  apart. `OFF_BY_ONE_RANGE` and `WRONG_INITIAL_VALUE` are asymmetric (many fixes per bug), so they
+  have separate functions.
+
+### 3.6 `_shift`: arithmetic that keeps code readable
+
+- **Decision**: shifting an index by +1 simplifies when it can: `n - 1` + 1 gives `n`, and
+  `i - 1` + 1 gives `i`.
+- **Why (intuition)**: otherwise the bug `range(n)` -> `range(n - 1)` and a fix would produce
+  `n - 1 + 1`, which is correct but looks nothing like a student's code and would never compare
+  equal to the original. Realistic-looking code matters because the classifier reads the text.
+  (Spotted detail: Python parses `-1` as unary-minus applied to `1`, not as the number -1, so
+  `_int_value` handles that case explicitly.)
+
+### 3.7 The `not` toggle is applied to every `if` and `while`
+
+- **Decision**: `LOGIC_OPERATOR` includes wrapping/unwrapping `not` on conditions, as the spec asks.
+- **Honest consequence**: nearly every function has an `if`, so this operator can break almost
+  any function (`if not xs[i] > best`). It models "inverted condition" mistakes but is a blunt
+  tool. Many of those bugs are very different in style from `and`/`or` confusion, so
+  `LOGIC_OPERATOR` is a mixed class. Worth mentioning in the limitations.
+
+### 3.8 What the demo showed (real output)
+
+- Injecting into `find_max`: `range(1, len(xs))` -> `range(1, len(xs) - 1)`. The buggy code
+  fails the tests (last element skipped).
+- Of 4 repair candidates for `OFF_BY_ONE_RANGE`, **exactly one** passes (`stop +1`). The same bug
+  with the *wrong* label (`COMPARISON_BOUNDARY`) has **no** passing repair. This is the core
+  mechanism of the verifier in one example: a wrong diagnosis cannot be "fixed" by the wrong
+  kind of repair.
+- Mutants available per class (before the equivalent-mutant filter of Step 5):
+
+  | Class | Mutants | Problems hosting it |
+  |---|---|---|
+  | OFF_BY_ONE_RANGE | 36 | 18 |
+  | WRONG_INDEX | 74 | 19 |
+  | COMPARISON_BOUNDARY | 16 | 9 |
+  | LOGIC_OPERATOR | 27 | 16 |
+  | WRONG_INITIAL_VALUE | 16 | 14 |
+
+### 3.9 Open issue to handle in Step 5: class imbalance
+
+- `WRONG_INDEX` (74) dwarfs `COMPARISON_BOUNDARY` and `WRONG_INITIAL_VALUE` (16 each). If we
+  feed everything in, the model could score well just by favouring the big class, and
+  **macro-F1** (which treats classes equally) would expose it.
+- Planned fix (in the generator, not here): cap or sample the same number of variants per
+  problem and class (`variants_per_problem` in `config.py`), and report per-class F1. The
+  imbalance is a property of the *code*, not something to hide: report the class counts per
+  split, as the spec requires.
+
+### 3.10 Tests written here and what they do NOT cover
+
+- Checked: every class applies to at least 3 problems; mutants parse and differ from the
+  original; every mutant is undoable by its own repair; no two classes produce identical buggy
+  text (otherwise a label would be ambiguous). That last one passed, which was not guaranteed.
+- **Not yet checked**: that mutants actually *fail the tests* and repairs *pass them*. That
+  needs the sandbox (Step 4), because running mutated code in-process is unsafe. The demo above
+  used a throwaway in-process runner on one trusted function only. The full test comes with the
+  sandbox.
+
+---
+
+<!-- Next entry: Step 4: sandbox.py + verifier.py -->
