@@ -135,7 +135,8 @@ Files: `config.py`, `codecoach/utils.py`, `requirements.txt`, `.gitignore`, fold
 
 ## Step 2: The problem set (`codecoach/problems.py`)
 
-Files: `codecoach/problems.py`, `tests/test_problems.py`. Result: 20 problems, 169 tests.
+Files: `codecoach/problems.py`, `tests/test_problems.py`. Result at this step: 20 problems, 169 tests.
+(Step 5 later added 4 more comparison-heavy problems: now 24. See 5.11.)
 
 ### 2.1 Tests define "correct", not a human and not the model
 
@@ -460,4 +461,174 @@ really fail the tests and repairs really fix them.
 
 ---
 
-<!-- Next entry: Step 5: generator.py (dataset + splits) -->
+## Step 5: Dataset and splits (`codecoach/generator.py`, `scripts/01_generate_data.py`)
+
+Files: `generator.py`, `styles.py`, `01_generate_data.py`, `tests/test_generator.py`, `tests/test_styles.py`,
+plus `split_sizes` / `min_seed_per_class` / `min_class_per_split` in `config.py`. Output: `data/generated/splits.json` (git-ignored).
+
+### 5.1 Split by problem, not by sample
+
+- **Decision**: whole *functions* go to train, dev, meta_dev or test (10 / 4 / 3 / 3 problems).
+- **Alternative**: shuffle all buggy variants and cut 70/15/15.
+- **Why (intuition)**: ten variants of `find_max` look nearly the same. A random cut puts some in train and
+  some in test, so the model gets "tested" on a function it has memorised. Its score would measure memory, not
+  understanding of the misconception. Splitting by problem means test functions are strangers.
+
+### 5.2 Why there are four splits (one purpose each)
+
+| Split | Used for | Why it must be separate |
+|---|---|---|
+| seed | the only labeled training data | simulates "few labels" |
+| pool | unlabeled code the teacher diagnoses | the true label is kept as `hidden_label`, only for measuring verifier precision afterwards |
+| dev | Level 0 gates and Level 1 fitness | needed to choose between versions |
+| meta_dev | **only** accepts/rejects improver edits (Level 2) | if the improver were judged on dev, it would learn to please dev (the data the pipeline was already tuned on) |
+| test | final tables | touched last, never used to choose anything |
+
+Selection pressure "uses up" a split: whatever you choose on, you overfit to. So every decision level
+gets its own data.
+
+### 5.3 The pool's label is hidden by the *type*, not by a promise
+
+- **Decision**: pool items are `PoolSample(code, problem, hidden_label)`. Labeled data are
+  `Sample(code, problem, label, edit)`. A test checks the pool has no `.label` attribute.
+- **Why (intuition)**: self-training must never peek at true labels. If both used the same class with a
+  `label` field, one careless line `s.label` would leak the answer and nobody would notice. With a
+  different type and an ugly name (`hidden_label`), a leak has to be written on purpose and stands out in review.
+  The pool also drops `edit`, which would reveal the label too.
+
+### 5.4 Equivalent-mutant filter
+
+- **Decision**: after injecting, run every candidate through the sandbox; keep only those that **fail**
+  the tests. (15 of 169 were dropped, 37% of one class: see Step 4.)
+- **Why (intuition)**: an "equivalent mutant" behaves like the correct program, so labelling it
+  `COMPARISON_BOUNDARY` teaches the model a false thing, and no repair can "fix" it (tests already pass).
+
+### 5.5 Name normalization (`f`, `v1`, `v2`...)
+
+- **Decision**: function becomes `f`, parameters and locals become `v1, v2...` in order of appearance;
+  builtins (`len`, `range`) stay.
+- **Why (intuition)**: otherwise the classifier can latch onto names (`total` often means "initial value
+  bug") that real students would not share. We want it to read structure. It also makes unrelated
+  problems look more alike, which is closer to testing "do you understand the bug type".
+- **Order detail**: mutate **after** normalizing, so the stored code is exactly what the model sees and
+  exactly what the verifier repairs (the verifier calls `f`, via `normalized_problem`).
+
+### 5.6 Retry the split until every split has all 5 classes
+
+- **Decision**: shuffle problems until train/dev/meta_dev/test each contain every class (seeded, so the
+  result is deterministic).
+- **Why (intuition)**: a split lacking a class makes that class's F1 undefined (0/0) and macro-F1
+  meaningless there. This is a reproducible search over *which functions go where* using only class
+  presence, never model scores.
+
+### 5.7 Seed is stratified with a minimum
+
+- **Decision**: ~15% of each class, but at least `min_seed_per_class = 2`.
+- **Why (intuition)**: random 15% of a 10-sample class could be 1 or 0 and drop a class from the seed.
+
+### 5.8 PROBLEM FOUND: the dataset is small, and the small classes are tiny
+
+Real output of `python scripts/01_generate_data.py` (154 samples in total):
+
+| split | OFF_BY_ONE | WRONG_INDEX | COMPARISON | LOGIC | WRONG_INIT | total |
+|---|---|---|---|---|---|---|
+| seed | 3 | 6 | 2 | 2 | 2 | 15 |
+| pool (hidden) | 15 | 36 | 2 | 13 | 6 | 72 |
+| dev | 6 | 9 | 2 | 5 | 2 | 24 |
+| meta_dev | 5 | 10 | 2 | 3 | 3 | 23 |
+| test | 6 | 6 | 2 | 4 | 2 | 20 |
+
+Why this matters:
+- `COMPARISON_BOUNDARY` has **2 samples** in dev, meta_dev and test and **2 in the pool**. One wrong prediction
+  moves its F1 by about 0.3 and macro-F1 by about 0.06. Our gate thresholds are `min_delta = 0.005` and
+  `max_class_drop = 0.10`, so the gates would mostly react to **noise**, and the improver would be
+  rewarded for luck.
+- The pool has 72 items, but the spec's `POOL_PER_ROUND = 300` assumes far more.
+- The seed has 15 labeled examples for 5 classes. The teacher starts very weak (intended), but 2 per class
+  may be too few to learn anything.
+- The cause: only 20 functions with single-place bugs give about 154 distinct buggy programs. The
+  imbalance from Step 3.9 is inherited (some classes only fit a few functions).
+
+This was a *decision for the user*, not something to hide or silently fix. The user chose style-variant
+augmentation (5.9). That was not enough on its own (5.10), so we also used the spec's room for up to 24
+problems (5.11). Final numbers are in 5.12.
+
+### 5.9 Style-variant augmentation (`codecoach/styles.py`)
+
+- **Decision**: before injecting bugs, rewrite each reference solution in equivalent styles, using three
+  behaviour-preserving AST rewrites and every combination of them (up to 8 variants):
+  1. `x += e` becomes `x = x + e`
+  2. `a > b` becomes `b < a` (ordering comparisons only)
+  3. `if A and B: ...` becomes nested `if A: if B: ...`
+- **Why (intuition)**: students write the same logic in different shapes, and the classifier should learn the
+  *bug*, not one specific template. It also multiplies the data without inventing new logic.
+- **Why it cannot leak**: every style variant belongs to its problem, and splits are by problem, so no style
+  variant of a test function ever appears in train.
+- **Safety net**: a test runs every style variant of every problem through the sandbox; all must still pass the
+  problem's tests (a rewrite that changed behaviour would silently create wrong "correct" code).
+- **Bug found while building it**: Python 3.13's `ast.unparse` needs line numbers on statement nodes; the
+  `Assign` created by rewrite 1 had none and crashed. Fixed with `ast.fix_missing_locations`.
+- **Ambiguity guard**: if two styles produce identical buggy text under different labels, the sample is
+  dropped (a label for it would be arbitrary).
+
+### 5.10 Augmentation alone was not enough: the host-function problem
+
+- After augmentation: 319 samples, but `COMPARISON_BOUNDARY` still had only 2 samples in `dev` while
+  `meta_dev` had 14. I then asked for at least 5 samples per class in every split, and **no partition
+  existed**.
+- **Root cause**: `COMPARISON_BOUNDARY` can only be injected into functions that contain a comparison
+  where ties matter. Only **6 of the 20** problems did (`binary_search`, `count_in_range`, `all_positive`,
+  `is_sorted`, `merge_two_sorted`, `count_greater`), and two of them held most of the samples. Six
+  functions cannot feed four splits. Rewriting styles multiplies *variants of those 6 functions*, not the
+  number of different functions.
+- **Lesson to remember**: more data from the same functions is not more diversity. Diversity comes from
+  different host functions. I diagnosed this by listing which problems host which class before changing
+  anything, rather than lowering the threshold to make the error go away.
+
+### 5.11 Four new problems (the spec allows 18-24)
+
+- **Decision**: added `count_negative`, `all_below`, `first_index_above`, `is_strictly_increasing`
+  (now 24 problems, 7-10 tests each; `split_sizes` is now `(12, 4, 4, 4)`).
+- **Why these**: ties must change the answer, otherwise `<` vs `<=` is an equivalent mutant and is
+  filtered out (like `find_max`). For example `all_below([5], 5)` must be False, so `>=` to `>` is caught.
+- This stays inside the spec's 18-24 range. It does make the Step 2 numbers outdated (20 problems, 169
+  tests); the code is the source of truth.
+
+### 5.12 Split search: valid first, then best
+
+- **Decision**: try 3000 seeded shuffles of the problems. A partition is *valid* if every split has at
+  least `min_class_per_split = 5` samples of every class. Among valid ones, choose the one whose **training**
+  set has the most samples of its scarcest class.
+- **Why (intuition)**: "first valid" gave a train set with 6 `COMPARISON_BOUNDARY` samples and a test set
+  with 24, which is backwards: the model learns from the least. The choice uses **only class counts**, never
+  model scores, so it cannot leak test information. It is a deliberate, documented, seeded decision
+  about which *functions* go where.
+- **Honest limit**: this chooses the partition once, by us. A different partition would give different
+  scores. Reporting a few partitions would be more convincing; that is listed in the limitations.
+
+Final dataset (real output, 381 samples, 24 problems):
+
+| split | OFF_BY_ONE | WRONG_INDEX | COMPARISON | LOGIC | WRONG_INIT | total |
+|---|---|---|---|---|---|---|
+| seed | 7 | 12 | 3 | 5 | 3 | 30 |
+| pool (hidden) | 41 | 70 | 17 | 27 | 17 | 172 |
+| dev | 8 | 16 | 12 | 19 | 12 | 67 |
+| meta_dev | 18 | 20 | 6 | 11 | 7 | 62 |
+| test | 18 | 12 | 6 | 8 | 6 | 50 |
+
+Compared with the first attempt (154 samples, as few as 2 per class per split): the pool grew from 72 to
+172, and every evaluation split now has at least 6 per class. Still small, still noisy: with 6 samples one
+mistake moves that class's F1 by roughly 0.1. The `min_delta` gate and repeated evaluation must account for
+this; it is also a stated limitation. The seed has only 3 samples for two classes: the teacher starts weak
+on purpose.
+
+### 5.13 Tests (9) and what they prove
+
+Splits share no problems; samples belong to their split's problems; every split has every class; pool hides
+its label and is disjoint from seed; every dev/test sample really fails its tests; names are normalized;
+the build is reproducible (same seed gives the identical dataset) and survives a save/load round-trip;
+every style variant still passes the problem's tests; style rewrites really add variety.
+
+---
+
+<!-- Next entry: Step 6: self-training (Level 0) -->

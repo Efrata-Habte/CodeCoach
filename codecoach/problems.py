@@ -1,4 +1,4 @@
-"""Reference solutions + hidden unit tests for 20 beginner functions.
+"""Reference solutions + hidden unit tests for 24 beginner functions.
 
 This file is DATA (so it is longer than the other modules). Everything downstream depends on it:
   - the generator injects bugs into these solutions,
@@ -235,6 +235,42 @@ PROBLEMS: list[Problem] = [
     return count
 ''', [(([],), 0), (([1],), 0), (([1, 1],), 1), (([1, 2],), 0), (([1, 1, 1],), 2),
       (([1, 2, 2, 3, 3],), 2), (([2, 1, 1],), 1), (([5, 5, 6],), 1), (([1, 2, 1],), 0)]),
+
+    # --- added in Step 5: comparison-heavy functions where ties matter (< vs <= changes the answer),
+    # --- because COMPARISON_BOUNDARY had too few host functions to fill every split.
+    _make('''def count_negative(xs):
+    count = 0
+    for i in range(len(xs)):
+        if xs[i] < 0:
+            count += 1
+    return count
+''', [(([],), 0), (([-1],), 1), (([0],), 0), (([1, -2, 3, -4],), 2), (([0, 0, -1],), 1),
+      (([-1, -1],), 2), (([5],), 0), (([0, -1],), 1), (([1, 2, -3],), 1)]),
+
+    _make('''def all_below(xs, limit):
+    for i in range(len(xs)):
+        if xs[i] >= limit:
+            return False
+    return True
+''', [(([], 5), True), (([1], 5), True), (([5], 5), False), (([1, 2, 3], 4), True),
+      (([1, 2, 4], 4), False), (([4, 1], 4), False), (([6], 5), False), (([1, 9, 2], 5), False),
+      (([-3, -1], 0), True)]),
+
+    _make('''def first_index_above(xs, t):
+    for i in range(len(xs)):
+        if xs[i] > t:
+            return i
+    return -1
+''', [(([], 3), -1), (([5], 3), 0), (([3], 3), -1), (([1, 2, 3, 4], 2), 2), (([1, 5, 9], 5), 2),
+      (([9, 1], 5), 0), (([1, 2], 5), -1), (([1, 2, 3], 0), 0), (([2, 2, 7], 2), 2)]),
+
+    _make('''def is_strictly_increasing(xs):
+    for i in range(len(xs) - 1):
+        if xs[i] >= xs[i + 1]:
+            return False
+    return True
+''', [(([],), True), (([1],), True), (([1, 2],), True), (([2, 1],), False), (([1, 1],), False),
+      (([1, 2, 3],), True), (([1, 2, 2],), False), (([1, 3, 2],), False), (([3, 2, 1],), False)]),
 ]
 
 BY_NAME: dict[str, Problem] = {p.name: p for p in PROBLEMS}

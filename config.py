@@ -14,8 +14,12 @@ class Config:
     distill_seeds: tuple = (0, 1, 2)      # 3 seeds for the distillation comparison
 
     # --- data ------------------------------------------------------------
-    seed_fraction: float = 0.15           # share of train problems' samples that are labeled
-    variants_per_problem: int = 12        # buggy variants generated per problem and class
+    seed_fraction: float = 0.15           # share of train samples that are labeled
+    min_seed_per_class: int = 2           # ...but every class needs at least this many labeled seeds
+    variants_per_problem: int = 12        # cap: buggy variants kept per (problem, class)
+    split_sizes: tuple = (12, 4, 4, 4)    # problems per split: train, dev, meta_dev, test (sum = 24)
+    min_class_per_split: int = 5          # every class needs >= this many samples in EVERY split
+                                          # (fewer -> per-class F1 is noise and the gates react to luck)
 
     # --- sandbox / verifier ----------------------------------------------
     test_timeout_s: float = 2.0           # kill a candidate function that runs longer (infinite loops)
