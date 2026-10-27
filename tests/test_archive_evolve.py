@@ -160,6 +160,26 @@ def test_tamper_error_aborts_the_run(sandboxed_archive) -> None:
                                   random.Random(0), log=lambda s: None)
 
 
+def test_llm_proposals_are_logged_as_llm_and_go_through_the_same_safety_check(sandboxed_archive) -> None:
+    arch, calls = sandboxed_archive, []
+    _baseline(arch)
+    unsafe = lambda parent, src: ("import os\n" + src, "LLM edit")  # noqa: E731 - an LLM answer that breaks the rules
+    _load_script().run_level1(replace(Config(), generations=4, patience=100), arch, improver,
+                              lambda s: calls.append(s) or _fake_eval(s), random.Random(0), log=lambda s: None, llm_propose=unsafe)
+    by_gen = {v.generation: v for v in arch.versions if v.generation > 0}
+    assert [by_gen[g].proposer for g in (1, 2, 3, 4)] == ["rule_based", "llm", "rule_based", "llm"]  # every 2nd gen
+    assert all(by_gen[g].reason.startswith("unsafe") and not by_gen[g].accepted for g in (2, 4))
+    assert all("import os" not in c for c in calls)  # the unsafe LLM files were never evaluated
+
+
+def test_llm_returning_none_falls_back_to_the_rule_based_improver(sandboxed_archive) -> None:
+    arch = sandboxed_archive
+    _baseline(arch)
+    _load_script().run_level1(replace(Config(), generations=4, patience=100), arch, improver, _fake_eval, random.Random(0),
+                              log=lambda s: None, llm_propose=lambda parent, src: None)
+    assert {v.proposer for v in arch.versions if v.generation > 0} == {"rule_based"}
+
+
 # ---- Level 2: the improver edits itself --------------------------------------------------------------------------
 IMPROVER_SRC = normalize_source((ROOT / "evolvable" / "improver.py").read_text(encoding="utf-8"))
 

@@ -3,5 +3,6 @@ __pycache__/
 .pytest_cache/
 data/generated/
 archive/
+.run_all.lock
 results/*
 !results/.gitkeep

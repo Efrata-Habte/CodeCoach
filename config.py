@@ -47,6 +47,9 @@ class Config:
     T_grid: tuple = (2.0, 4.0)
     alpha_grid: tuple = (0.3, 0.7)
     student_hidden: int = 16
+    student_epochs: int = 80              # fixed budget for every student (same for hard and distilled)
+    student_lr: float = 5e-3
+    latency_runs: int = 200               # single-sample forward passes timed (median reported)
 
     # --- optional LLM proposer (off by default) --------------------------
     use_llm: bool = False

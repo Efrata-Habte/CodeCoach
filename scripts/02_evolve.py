@@ -121,19 +121,24 @@ class Level2:
 
 def run_level1(cfg: Config, archive: Archive, improver, evaluate_fn: Callable[[str], EvalOutcome],
                rng: random.Random, log: Callable[[str], None] = print, level2: Level2 | None = None,
-               on_event: Callable[[dict], None] | None = None) -> None:
-    """Run up to cfg.generations pipeline edits (plus a Level 2 step every K gens if `level2` is given)."""
+               on_event: Callable[[dict], None] | None = None, llm_propose: Callable | None = None) -> None:
+    """Run up to cfg.generations pipeline edits (plus a Level 2 step every K gens if `level2` is given).
+
+    `llm_propose` (optional, off by default) replaces the rule-based proposal on every second generation; whatever it
+    returns goes through the same safety check, evaluator and gate. If it returns None the rule-based improver is used."""
     seen = {normalize_source(archive.source(v.id)) for v in archive.versions if v.kind == "pipeline"}
     best = max(v.metrics["dev_macro_f1"] for v in archive.accepted())
     stale = 0  # generations since the best score last improved
     for gen in range(1, cfg.generations + 1):
         pool = [{"id": v.id, "dev_f1": v.metrics["dev_macro_f1"], "order": i} for i, v in enumerate(archive.accepted())]
         parent = archive.get(improver.choose_parent(pool, rng))
-        child, edit = improver.propose_child(archive.source(parent.id), rng)
+        proposal = llm_propose(parent, archive.source(parent.id)) if llm_propose and gen % 2 == 0 else None
+        proposer = "llm" if proposal else "rule_based"  # logged per version, as the spec asks
+        child, edit = proposal if proposal else improver.propose_child(archive.source(parent.id), rng)
         if child in seen:  # same code as an existing version: re-evaluating wastes budget
-            v = record(archive, None, child, parent.id, edit, gen, False, "duplicate")
+            v = record(archive, None, child, parent.id, edit, gen, False, "duplicate", proposer)
         elif not (report := safety.check(child, "pipeline")).ok:
-            v = record(archive, None, child, parent.id, edit, gen, False, "unsafe: " + ", ".join(report.reasons[:2]))
+            v = record(archive, None, child, parent.id, edit, gen, False, "unsafe: " + ", ".join(report.reasons[:2]), proposer)
         else:
             seen.add(child)
             out = evaluate_fn(child)
@@ -141,7 +146,7 @@ def run_level1(cfg: Config, archive: Archive, improver, evaluate_fn: Callable[[s
             # Gate: accept only if dev F1 beats the PARENT by min_delta -> no drift from noise
             ok = out.ok and gain >= cfg.min_delta
             v = record(archive, out, child, parent.id, edit, gen, ok,
-                       "accepted" if ok else ("no_improvement" if out.ok else out.reason))
+                       "accepted" if ok else ("no_improvement" if out.ok else out.reason), proposer)
         f1 = v.metrics["dev_macro_f1"] if v.metrics else float("nan")
         log(f"gen {gen:02d} | {v.id} <- {parent.id} | {edit[:52]:52s} | dev {f1:.3f} | "
             f"{'ACCEPTED' if v.accepted else 'rejected: ' + v.reason}")
@@ -171,16 +176,41 @@ def summarize(archive: Archive) -> dict:
             "final_improver_id": next(v.id for v in reversed(imps) if v.accepted)}
 
 
+def verifier_ablation(cfg: Config) -> None:
+    """Level 0 with the verifier vs with confidence-threshold pseudo-labels (baseline and best pipeline, 3 seeds)."""
+    from codecoach.ablation import run_verifier_ablation
+    from codecoach.generator import load_splits
+    archive = Archive()
+    if not archive.versions:
+        sys.exit("No archive yet: run scripts/02_evolve.py first.")
+    best = max(archive.accepted(), key=lambda v: v.metrics["dev_macro_f1"])
+    pipes = {i: import_source(archive.source(i), f"ablation_{i}") for i in dict.fromkeys(["v000", best.id])}
+    data = ROOT / "data" / "generated"
+    result = run_verifier_ablation(cfg, pipes, load_splits(data / "splits.json"), json.loads((data / "verdicts.json").read_text()))
+    (ROOT / "results" / "ablation_verifier.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
+    for mode in result["modes"]:
+        rows = result[mode]
+        prec = [r["pseudo_label_precision"] for r in rows if r["pseudo_label_precision"] is not None]
+        print(f"{mode:10s} precision {sum(prec) / max(1, len(prec)):.3f} | pseudo-labels {sum(r['n_pseudo'] for r in rows) / len(rows):.1f} | "
+              f"dev F1 {sum(r['dev_f1'] for r in rows) / len(rows):.3f} | meta_dev F1 {sum(r['meta_dev_f1'] for r in rows) / len(rows):.3f}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--no-level2", action="store_true", help="ablation: the improver never edits itself")
     ap.add_argument("--tag", default="", help="store in archive/<tag>/ (ablation runs need their own archive)")
+    ap.add_argument("--seed", type=int, default=0, help="evolution seed (the dataset itself is always generated with seed 0)")
+    ap.add_argument("--llm", action="store_true", help="optional: let Claude propose some edits (needs ANTHROPIC_API_KEY)")
+    ap.add_argument("--verifier-ablation", action="store_true", help="ablation: verifier vs confidence pseudo-labels (needs an archive)")
     args = ap.parse_args()
-    cfg = get_config(args.quick)
+    cfg = replace(get_config(args.quick), seed=args.seed)
     cfg = replace(cfg, ablate_level2=True) if args.no_level2 else cfg
+    cfg = replace(cfg, use_llm=True) if args.llm else cfg
     if not (ROOT / "data" / "generated" / "verdicts.json").exists():
         sys.exit("No data yet: run `python scripts/01_generate_data.py` first.")
+    if args.verifier_ablation:
+        return verifier_ablation(cfg)
     archive = Archive(ROOT / "archive" / args.tag if args.tag else None)
     if archive.versions:
         sys.exit(f"{archive.root} is not empty: delete it for a fresh run (every run starts from v000).")
@@ -196,7 +226,8 @@ def main() -> None:
     record(archive, out, baseline, None, "baseline", 0, True, "baseline", "baseline")
     print(f"v000 baseline | dev {out.metrics['dev_macro_f1']:.3f} | meta_dev {out.metrics['meta_dev_macro_f1']:.3f}")
     level2 = None if cfg.ablate_level2 else Level2(cfg, archive, evaluate_fn)
-    run_level1(cfg, archive, improver, evaluate_fn, rng, level2=level2)
+    from codecoach.llm_proposer import make_proposer  # optional feature: returns None unless enabled AND a key is set
+    run_level1(cfg, archive, improver, evaluate_fn, rng, level2=level2, llm_propose=make_proposer(cfg))
     summary = summarize(archive)
     (ROOT / "results").mkdir(exist_ok=True)
     (ROOT / "results" / f"evolution_summary{'_' + args.tag if args.tag else ''}.json").write_text(

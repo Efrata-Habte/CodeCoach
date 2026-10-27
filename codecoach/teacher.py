@@ -76,6 +76,20 @@ class Teacher:
         return sum(p.numel() for p in self.model.parameters())
 
 
+def load_teacher(pipe: ModuleType, ckpt_path) -> Teacher:
+    """Rebuild a saved Teacher (weights + n-gram vocabulary) from archive/<version>/model.pt.
+
+    The file is written by our own evaluator and contains a scikit-learn vectorizer, hence weights_only=False.
+    """
+    ckpt = torch.load(ckpt_path, weights_only=False)
+    featurizer = Featurizer(pipe)
+    featurizer.tfidf = ckpt["tfidf"]
+    dim = len(featurizer.tfidf.vocabulary_) + len(pipe.extra_features("def f(v1):\n    return v1"))
+    model = pipe.build_teacher(dim, len(LABELS))
+    model.load_state_dict(ckpt["state_dict"])
+    return Teacher(model.eval(), featurizer)
+
+
 def fit_teacher(pipe: ModuleType, featurizer: Featurizer, examples: list[tuple[str, str]], seed: int) -> Teacher:
     """Train a Teacher on (code, label) pairs."""
     X = featurizer.transform([c for c, _ in examples])

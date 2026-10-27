@@ -1106,6 +1106,263 @@ sandboxed evaluator, gate, archive record, rollback). What it does NOT show: tha
 
 ---
 
-<!-- Next entry: Step 9: distillation + figures -->
+## Step 9: Distillation and figures (`distillation.py`, `03_distill.py`, `05_make_figures.py`)
+
+Files: `codecoach/distillation.py` (61 lines), `scripts/03_distill.py` (112), `scripts/05_make_figures.py`,
+metrics added to `evaluation.py` (params, size, latency), `load_teacher` in `teacher.py`, `tests/test_distillation.py` (7 tests).
+
+### 9.1 The loss, and what each part is for
+
+`L = alpha * CE(y, student) + (1 - alpha) * T^2 * KL( softmax(teacher/T) || softmax(student/T) )`
+- **CE term**: learn the right answer. **KL term**: copy the teacher's *whole* probability picture, including "this also
+  looks a bit like OFF_BY_ONE_RANGE" (dark knowledge): information a hard label throws away.
+- **Temperature T** softens both distributions so small probabilities become visible (T = 1 would be nearly one-hot).
+- **T^2** compensates for the KL gradient shrinking like 1/T^2, so the two terms stay comparable (Hinton et al. 2015).
+- **alpha = 1 is "no distillation"**: the hard-label baseline uses the very same code path with `alpha = 1`
+  (a test checks `distillation_loss(alpha=1)` equals cross-entropy even when a teacher is supplied).
+- The teacher is `eval()` + `no_grad()`: it is a fixed source of targets, never trained by the student's loss.
+
+### 9.2 A fair comparison: same examples, same budget, only the TARGETS differ
+
+- **Decision**: all three students train on the same set: the labeled seed plus the pool programs the **verifier** confirmed for
+  the best teacher. Same architecture (input -> 16 -> 5), same epochs (80), same learning rate, same seed.
+  Hard student: true/verified hard labels. Distilled students: the teacher's soft outputs on those same programs.
+- **Why (intuition)**: if the distilled student saw more data, a win could come from the data, not from soft targets.
+  Controlling that makes "does distillation help?" a clean question. Students read the **best evolved version's features**
+  (as the spec says); the v000 teacher is applied to the same code strings, so only the teacher differs.
+- **Hyper-parameters**: `T in {2, 4}` x `alpha in {0.3, 0.7}` are chosen **per seed on dev macro-F1**; the synthetic `test` split is
+  only reported. `student_epochs` and `student_lr` are fixed in `config.py` and were not tuned.
+
+### 9.3 Three seeds, including the teachers
+
+For each seed, **both teachers are re-trained** (Level 0 with seed s), then the students distilled from them. So the standard
+deviations include teacher variability, not just student variability. Metrics per model: macro precision / recall / F1 (test),
+number of parameters, size (KB of the saved `state_dict`: what you would ship) and **CPU latency**: median of 200 single-sample
+forward passes after 20 warm-ups, 1 thread (median so an OS hiccup does not distort it). Latency excludes featurization
+(features are precomputed), for every model alike: it times the model, not the tokenizer.
+
+### 9.4 REAL RESULTS (quick archive: best = v006; 3 seeds; test = 50 synthetic programs)
+
+| Model | Test macro-F1 | Params | Size KB | Latency ms |
+|---|---|---|---|---|
+| teacher v000 | 0.435 +- 0.012 | 235,013 | 921 | 0.038 |
+| teacher best (v006) | 0.479 +- 0.025 | 235,269 | 922 | 0.057 |
+| student hard-label | 0.523 +- 0.101 | 12,693 | 52 | 0.020 |
+| student distilled from v000 | 0.470 +- 0.031 | 12,693 | 52 | 0.019 |
+| student distilled from best | 0.475 +- 0.051 | 12,693 | 52 | 0.017 |
+
+What this says, honestly:
+- **Evolved teacher beats v000 on the synthetic test in all 3 seeds** (0.490/0.502/0.445 vs 0.427/0.452/0.425). The test split was
+  never used to select anything, so this is selection-independent evidence of a *small* gain (+0.044 on average).
+- **Students are about 18x smaller (52 KB vs 921 KB) and about 2-3x faster per sample**, with no loss of F1 relative to the teachers.
+- **Distillation did NOT beat the hard-label student** (0.475 vs 0.523, std 0.05-0.10): a null result, within noise. Plausible reasons
+  (not tested, so not claimed as facts): the hard-label student already gets verified pseudo-labels; the teachers are weak (F1 about
+  0.45), so their soft targets carry little extra information; 50 test programs and 3 seeds are too few to resolve differences this small.
+- **A student beating its teacher** is possible here because the student trains on *all* verified examples while the teacher's training
+  set is curated and capped (30 per class). This is a capacity-gap non-issue at this scale: the teacher is not much bigger in "knowledge".
+- We report this as is; no tuning to make distillation look good.
+
+### 9.5 Figures (`scripts/05_make_figures.py`)
+
+Seven PNGs in `results/figures/`, each titled as the question it answers. Palette: validated categorical slots (blue, orange,
+aqua); accepted vs rejected also differ by marker (filled vs hollow). Two layout bugs were caught only by **looking at the render**
+(overlapping labels and a legend over an error bar): a color validator cannot see layout. Figures whose data is not ready yet are
+skipped with a message (verifier ablation arrives in Step 12).
+
+### 9.6 Limitations of this step
+
+- 3 seeds and 50 test programs: differences below about 0.05 F1 are not resolvable.
+- The best version was chosen by dev F1 (optimistic); the test comparison above is the independent check.
+- Latency is single-machine, single-thread, model-only.
+- Students were trained on a small shared set (seed + verified), about 100-200 programs.
+
+---
+
+## Step 10: The hand-written final test (`data/handwritten/`, `scripts/04_final_test.py`)
+
+Files: `data/handwritten/cases.py` (25 cases) + `README.md`, `scripts/04_final_test.py`, `tests/test_handwritten.py`,
+`tests/test_final_test_guard.py`, `load_student` in `distillation.py`. **The final test has NOT been run.**
+
+### 10.1 What the set is, and why it is different on purpose
+
+- 25 buggy functions, 5 per class, on problems that are **not** in `problems.py`, with other names, `while` loops (3) and loops over
+  elements (`for v in values`) instead of `range(len(...))`. The training data never contains this style.
+- **Why (intuition)**: the synthetic test split is made by the same generator as the training data, so a model can score well by
+  learning the generator's habits. A hand-written set in another style asks the real question: *does it recognise the misconception,
+  or just our templates?* Expect lower numbers; that gap is the finding, not a failure.
+
+### 10.2 The data was validated with the verifier, not with any model
+
+`test_every_case_is_a_real_bug_that_its_own_label_can_fix` (sandbox + verifier only): each buggy function FAILS its tests, and a repair
+of its labelled class makes them pass. All 25 passed on the first run. (One style check failed first: only 2 `while` loops; I converted
+a third case rather than loosening the check.) This guards against a mislabeled or non-buggy case silently lowering the score.
+
+### 10.3 Used once: how that is enforced
+
+- `04_final_test.py` **refuses without `--final`** (tested by running it as a subprocess and checking it exits non-zero and writes nothing).
+- It writes `results/FINAL_TEST_DONE`. A re-run prints a boxed warning and refuses unless `--again` is passed, because after seeing the
+  result and changing anything, the set has become a tuning set.
+- Nothing else reads `cases.py` (the static check also forbids the names a candidate would need), and no script selects with it.
+- **I did not run it** (your spec: not unless you say so). Instead I dry-ran the *loading and prediction path* on 5 throwaway synthetic dev
+  programs, so that your one real run cannot fail on a loading bug. All four models loaded (teacher v000, teacher best, hard student,
+  distilled student).
+
+### 10.4 What it reports
+
+Per model: macro-F1, accuracy, per-class F1, predictions, and the **verified-fix rate**: how often the verifier confirms that a repair of the
+PREDICTED class actually fixes the program. That is a *usefulness* measure (a learner would get a working fix) and is independent of whether
+the label equals ours (recall the verifier can accept a different class's fix, Step 4.9).
+
+### 10.5 Observation from the dry run (not a result)
+
+On the 5 synthetic dev programs every model predicted almost only `WRONG_INDEX`, the biggest class. The final test will likely show the same
+majority-class bias, which macro-F1 is designed to expose. We will not be surprised by it.
+
+### 10.6 To do by the user before running
+
+Append 5-10 of your own real mistakes in the "MY CASES" section (instructions in `data/handwritten/README.md`), run
+`python -m pytest tests/test_handwritten.py` to validate them, then `python scripts/04_final_test.py --final` once.
+
+---
+
+## Step 11: The web app (`app/`)
+
+Files: `app/streamlit_app.py` (navigation shell), `app/common.py`, `app/live_logic.py`, nine modules in `app/views/`, `tests/test_app.py`
+(15 tests). Run: `python -m streamlit run app/streamlit_app.py` (the bare `streamlit` command is not on PATH on this machine, because
+`pip.exe` is blocked and packages live in the user site folder). Streamlit 1.66 was installed with `python -m pip install streamlit`.
+
+### 11.1 One module per page, imported only when selected
+
+- Your spec lists one file, but nine pages cannot stay under about 200 lines each in one file. Each page is `views/<name>.py` with a
+  `render(archive)` function; the shell imports it with `importlib` **only when selected**.
+- **Why (intuition)**: heavy imports (torch, scikit-learn) cost seconds. Pages that only read JSON never import them, so the first screen
+  appears fast. Measured with Streamlit's headless runner: first page 1.6 s, other pages 0.3-1.1 s (target: under 3 s).
+- The app is **read-only** over `archive/` and `results/`. The only things it writes are the live Level 1 run (to `archive/live/`, our scratch
+  folder) and nothing else. A friendly message ("run `python run_all.py --quick` first") appears when nothing exists yet (tested).
+
+### 11.2 The nine pages and what each proves
+
+| Page | What the audience sees |
+|---|---|
+| 1 Overview | the three levels in one sentence each, a flow diagram, headline cards: v000 vs best with deltas (dev, meta_dev, 3-seed synthetic test, features, params) |
+| 2 Evolution timeline | every version: accepted = filled green, rejected = hollow grey, best-so-far line, optional meta_dev line, rejection reasons, full table |
+| 3 Version vs previous | pick a version -> metric cards with deltas, per-class F1 parent vs child, two confusion matrices, a **colored diff of the source the system changed in itself**, lineage walk |
+| 4 Improver evolution | improver versions, utility old vs new, the probes, diff of `improver.py`, the Level 1 only vs Level 1 + 2 ablation |
+| 5 Self-training and verifier | stacked verified/rejected bars per round, precision vs raw accuracy, verifier-vs-confidence ablation |
+| 6 Distillation (live) | the precomputed 3-seed table and a bubble chart; **a button trains the hard-label and distilled student live** with a streaming loss curve |
+| 7 Try it (live learning) | paste a bug -> per-model probability bars -> verifier check + repaired code; **a weak learner learns from verified snippets in real time** |
+| 8 Live run | **watch Level 0 rounds arrive** (stacked bars update per round) or **watch Level 1 edit its own code** (table fills as versions are evaluated) |
+| 9 Safety and limitations | the guard-rail table mapped to code, the allowed/forbidden lists, a live tamper check, the limitations |
+
+### 11.3 How the live learning works (and why it is honest)
+
+- The learner starts as a teacher trained on the **30 labeled seed examples only**: weak on purpose, so learning is visible.
+- You choose the true class of a pasted snippet; the **verifier checks your label** against the hidden tests (it accepts only if a repair
+  of that class makes all tests pass). Verified snippets go into a buffer.
+- "Retrain now" trains a **candidate** on seed + buffer and applies the **same dev gate as Level 0**. If it fails, the old learner is
+  untouched (rollback). The page shows dev F1 before/after, the gate's verdict and the before/after prediction for the snippet.
+- **I did not soften the gate for the demo.** A single snippet rarely moves dev F1 by `min_delta`, so a rollback is a legitimate, honest
+  outcome; a few verified snippets usually give the gate something to accept. The buffer exists for exactly this reason.
+- The pure logic is in `live_logic.py` (no Streamlit), so it is unit-tested: right label verified, wrong label rejected, retraining goes
+  through the gate and rolls back when rejected (the old teacher *object* is unchanged).
+
+### 11.4 How it was tested
+
+- Headless `AppTest` renders **every page** with real results (no exceptions) and the empty-project message.
+- The live features are **clicked**: live distillation (two students trained, table shown), live Level 0 (rounds stream, success message),
+  Try-it start -> verify -> retrain. The live **Level 1** path (subprocess evaluators spawned from inside Streamlit, writing to `archive/live/`)
+  was run once headlessly: 3 generations in 16 s, no exception, main archive untouched.
+- The real server was started: healthy after 2 s, index page HTTP 200.
+- Not tested: a human in a real browser (layout/typography), and dark mode visually.
+
+### 11.5 Limitations
+
+- Live pages train in the Streamlit process; a rerun triggered mid-training restarts it. Run them once per demo step.
+- Try-it needs a function with exactly one `def`; the hidden tests exist only for the 24 known problems (others get an UNVERIFIED repair).
+- Live distillation reports on **dev**, not test (the test split stays reserved); it is one run, labelled as such on the page.
+
+---
+
+## Step 12: Ablations, `run_all.py`, documentation and the final runs
+
+Files: `codecoach/ablation.py`, `run_all.py`, `README.md`, `docs/{ARCHITECTURE,CONCEPTS,WALKTHROUGH,REPORT_DRAFT,SLIDES_OUTLINE}.md`;
+flags `--no-level2`, `--tag`, `--seed`, `--verifier-ablation` in `02_evolve.py`.
+
+### 12.1 Ablation 1: Level 1 only vs Level 1 + 2
+Same seed and budget, separate archive (`archive/level1_only/`). **The two runs are identical**: Level 2 never accepted an improver, and it uses its own
+random numbers (tested), so the pipeline trajectory is the same. Not a bug: a paired comparison whose answer is "no effect".
+
+### 12.2 Ablation 2: does the verifier matter? (and a finding about the baseline)
+`codecoach/ablation.py` runs Level 0 with pseudo-labels chosen by the verifier vs by model confidence, on the baseline and best pipeline x 3 seeds (6 runs per row).
+- **The specified baseline is vacuous.** The seed-only teacher's maximum confidence on the pool is **0.72**, so `confidence >= 0.9` selects **nothing** (not "bad
+  labels": zero labels). I checked this by printing the confidence distribution before believing the result.
+- **So a looser baseline was added: `confidence >= 0.5`.** It was chosen *after* seeing that 0.9 is empty; it admits a comparable number of labels (84 vs 95).
+  This is a post-hoc choice, stated as such. Both baselines are reported.
+
+| Pseudo-labels chosen by | precision (accepted rounds) | labels used | meta_dev F1 |
+|---|---|---|---|
+| verifier | 1.00 | 95 | 0.553 |
+| confidence >= 0.5 | 0.51 | 84 | 0.250 |
+| confidence >= 0.9 | n/a | 0 | 0.201 |
+
+Large, consistent effect (6 runs each). The reason: a weak model is poorly calibrated; half of its "confident" labels are wrong, and training on them hurts.
+Caveat: precision uses the hidden labels, only for reporting.
+
+### 12.3 `run_all.py`
+Runs scripts 01, 02 (main), 02 (Level 1 only), 02 (verifier ablation), optional extra evolution seeds, 03, 05 in order, stops at the first failure, writes
+`results/run_times.json`. `--final` adds the final test (never part of a normal run). **`--clean` never deletes `FINAL_TEST_DONE` / `final_test.json`**, so a
+cleanup cannot silently re-enable a spent final test.
+
+### 12.4 Incident: two runs at once, and the lock
+A second `run_all.py --clean` was started while a first run was in progress (my instructions had been ambiguous). The second run deleted `archive/` and regenerated
+`data/generated/` under the first, and the **tamper check aborted the first run** with `TamperError: protected files changed` (the guard-rail working as designed).
+Fix: `run_all.py` takes a lock file (created atomically with `O_EXCL`, removed at exit; a lock older than 3 hours is treated as stale). A second run now refuses
+with a clear message. I deliberately did **not** use `os.kill(pid, 0)` to detect a dead process: on Windows `os.kill` terminates the process.
+
+### 12.5 The final runs (this machine, CPU)
+- `python run_all.py --quick --clean`: **162 s**, every step passed.
+- `python run_all.py --clean --evo-seeds 3`: **1221 s = 20.4 min**, every step passed (01: 56 s, main evolution 183 s, Level 1 only 325 s, verifier ablation 125 s,
+  evolution seeds 1 and 2: 238 s and 267 s, distillation 24 s, figures 3 s).
+
+### 12.6 Results, honestly (details in `README.md` and `REPORT_DRAFT.md`)
+- Seed 0: dev 0.394 -> 0.567, meta_dev 0.536 -> 0.585; synthetic test (3 training seeds) 0.435 -> 0.513 (better in 2 of 3 seeds).
+- **Across 3 evolution seeds: dev +0.173 / +0.041 / +0.007, but meta_dev +0.049 / -0.070 / +0.009 (mean -0.004).** Evolution reliably improves what it selects on
+  and does not reliably improve held-out data. This is the central experimental finding.
+- Level 2: 0 of 7 proposals accepted (6 judged); in every judged check old and new utility were equal.
+- Distillation: students equal to the teacher at 18x smaller and 2x faster; the three students are not significantly different.
+- In the main run the dev gate rejected versions with higher meta_dev than the one it selected (v005 0.699, v016 0.712).
+
+### 12.7 Two corrections I made while writing the report
+1. I first wrote "every probe scored utility 0.000". Checking all three archives showed one judged check at +0.034; the accurate statement is "old and new were
+   exactly equal in every judged check". Claims in the README, report and slides were corrected.
+2. I had attributed `WRONG_INITIAL_VALUE`'s gain to specific feature edits; the evidence only supports "the best teacher scores 0.39 on it", so the report says we did not isolate the cause.
+
+---
+
+## Step 13: Optional LLM proposer (`codecoach/llm_proposer.py`)
+
+Files: `llm_proposer.py` (78 lines), `--llm` flag and `llm_propose` hook in `02_evolve.py`, `tests/test_llm_proposer.py` (7 tests) + 2 loop tests.
+
+### 13.1 What it does
+On every second generation (when enabled) Claude receives the parent source, its dev F1, per-class F1 and its 3 most common errors, and must return a **complete
+new file**. Model `claude-opus-5-5`, effort `medium` set explicitly. Capped by `max_llm_calls` (30). Each version records `proposer = "llm"` or `"rule_based"`.
+
+### 13.2 It gets no extra trust
+The returned file goes through the **same** static check, isolated evaluator and dev gate. A test proves that an LLM answer containing `import os` is recorded as
+`unsafe` and never evaluated. Anything wrong (no key, API error, refusal, `max_tokens`, no code block, a syntax error, budget spent, unevaluated parent) returns `None`
+and the rule-based improver is used: the optional feature cannot break a run.
+
+### 13.3 Off by default, and what is NOT verified
+Enabled only with `--llm` (or `use_llm=True`) **and** `ANTHROPIC_API_KEY`. The `anthropic` package is imported lazily, so the project works without it installed.
+**No real API call was made** (no key available), so the live request path is verified only against a fake client; the first real call may need adjusting.
+I did not enable the server-side `fallbacks` option (unverified shape); a refusal simply falls back to the rule-based proposer.
+
+---
+
+<!-- End of log. -->
+
+
+
+
 
 
