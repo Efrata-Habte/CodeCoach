@@ -347,4 +347,117 @@ Files: `codecoach/misconceptions.py`, `tests/test_misconceptions.py` (164 lines 
 
 ---
 
-<!-- Next entry: Step 4: sandbox.py + verifier.py -->
+## Step 4: Sandbox and verifier (`codecoach/sandbox.py`, `codecoach/verifier.py`)
+
+Files: `sandbox.py`, `verifier.py`, `tests/test_sandbox_verifier.py` (+ `test_timeout_s` in `config.py`).
+
+### 4.1 Run candidate code in a child process, with a timeout
+
+- **Decision**: each run is `python -I -c <runner>` as a subprocess. Code and tests go in as JSON on
+  stdin and a JSON result comes out on stdout. `subprocess.run(timeout=...)` kills the child.
+- **Alternative**: `exec()` in our own process, or a thread with a timeout.
+- **Why (intuition)**: a bug like `while True` never returns. In our own process it would freeze the
+  whole experiment, and Python cannot reliably kill a thread. A child process is disposable: we kill
+  it, write down "timeout", and move on. A crash or `exit()` inside it also cannot hurt us.
+- **Honest limit**: this is isolation and a time limit, **not a security jail**. It does not block
+  file or network access. That is acceptable here because candidates come from our own AST edits;
+  the self-edited source files get a separate static check in `safety.py` (Step 8). Also, Windows has
+  no `resource` module, so there is no memory cap at this level.
+
+### 4.2 Data in, result out: nothing is trusted from the child
+
+- **Decision**: the child prints one JSON line; the parent parses it. If it is missing or garbled
+  (child died), the result is `error`. `print()` calls inside the candidate are swallowed so they cannot
+  corrupt the output.
+- **Why (intuition)**: the child is the untrusted party. The parent should never assume it behaved.
+
+### 4.3 What counts as "passing", exactly
+
+- **Decision**: a test passes only if the function returns a value `==` to the expected one **and** the
+  bool-ness matches. An exception counts as a fail. Inputs are deep-copied per test.
+- **Why (intuition)**: in Python `1 == True`, so a function returning `1` would pass a test that expects
+  `True`. That is a real, silent hole, so we close it (there is a test). Deep-copying stops a buggy function
+  that modifies its list from corrupting the next test.
+
+### 4.4 Four outcomes, not two: `ok`, `tests_failed`, `timeout`, `error`
+
+- **Decision**: the sandbox keeps the *reason* for failing.
+- **Why (intuition)**: later we have to report **why** pseudo-labels were rejected (stacked bars per round,
+  failure analysis). Throwing the reason away now would make that impossible. A timeout (infinite loop) and
+  a wrong answer are different kinds of failure.
+
+### 4.5 Cache by hash of (source, function name, tests)
+
+- **Decision**: results are stored in an in-memory dict keyed by SHA-256. Cached call: 0.00005 s; real call:
+  about 0.035 s.
+- **Why (intuition)**: the same code with the same tests always gives the same answer, so running it twice is
+  waste. Self-training will verify thousands of candidates, and many repeat across rounds and generations.
+- **Known gap**: the cache lives only for one process. The evaluator (Step 7) runs each pipeline version in
+  its own subprocess, so those runs will not share it. If runtime becomes a problem we will add an on-disk
+  cache. Not done yet, because we should measure before optimising.
+
+### 4.6 Run the repair candidates in parallel
+
+- **Decision**: `run_tests_many` uses a thread pool (up to 8 workers). Each thread just waits for a child
+  process, so the GIL is no problem.
+- **Why (intuition)**: to *reject* a diagnosis we must try every repair of that class (up to a few dozen).
+  In parallel the wall-clock time is about one test run instead of many. Accepting stops being cheaper
+  only in the rare case where the first repair works.
+
+### 4.7 The verifier's inputs are deliberately poor
+
+- **Decision**: `verify(buggy_source, predicted_label, problem)`. It never receives the model's confidence
+  or the true label.
+- **Why (intuition)**: independence. If the verifier looked at confidence, "the model is sure" would leak
+  into "the model is right", which is exactly the self-confirmation failure we are fighting. The signature
+  makes cheating impossible by construction, not by promise. Only the **predicted** class's repairs are
+  tried, so a wrong label usually finds no working fix.
+
+### 4.8 Rejection reasons are logged
+
+- `no_repair_applicable` (e.g. predicted `COMPARISON_BOUNDARY` but the code has no comparison),
+  `tests_still_fail`, `timeout` (every candidate timed out). Reported per round in Level 0.
+
+### 4.9 Measured results (real numbers, from this run)
+
+Full guarantee test: every one of the 154 real bugs (mutants that fail the tests) is accepted when verified
+with its own label. Then, for each of those bugs, I verified it against each of the 4 **wrong** labels:
+
+| True class | Mutants | Equivalent (pass tests) | Wrong label wrongly accepted |
+|---|---|---|---|
+| OFF_BY_ONE_RANGE | 36 | 1 | 3 / 140 (2%) |
+| WRONG_INDEX | 74 | 7 | 3 / 268 (1%) |
+| COMPARISON_BOUNDARY | 16 | 6 | 0 / 40 |
+| LOGIC_OPERATOR | 27 | 0 | 1 / 108 (1%) |
+| WRONG_INITIAL_VALUE | 16 | 1 | 0 / 60 |
+| **Overall** | 169 | 15 | **1.1%** |
+
+Rejections of wrong labels: 461 `tests_still_fail`, 148 `no_repair_applicable`.
+
+What this tells us:
+- **The verifier is strict, not perfect**: about 1% false accepts on this synthetic data. It is a measured
+  property to report, not a guarantee. "Verifier precision" in the Level 0 logs will measure it the same way,
+  from the hidden true-label column.
+- **Why a wrong label can be accepted**: the verifier proves "*some* class-X fix makes the tests pass",
+  not "the student's mistake was class X". Example: `OFF_BY_ONE_RANGE -> WRONG_INITIAL_VALUE` (2 cases): a
+  loop that skips element 0 can also be repaired by starting the accumulator at `xs[0]`. Both programs are
+  correct as far as the tests can tell. So a "wrong" accept is sometimes a legitimate alternative fix. For
+  teaching, a *useful* diagnosis, but the label differs from what we injected.
+- **Equivalent mutants are common for one class**: 6 of 16 `COMPARISON_BOUNDARY` mutants (37%) pass all tests
+  (e.g. `<` vs `<=` in `find_max` does not change the result, because ties do not matter). They are not bugs,
+  so the generator must drop them (Step 5). After dropping: 10 `COMPARISON_BOUNDARY`, 15 `WRONG_INITIAL_VALUE`,
+  35 `OFF_BY_ONE_RANGE`, 67 `WRONG_INDEX`, 27 `LOGIC_OPERATOR`. The class imbalance from Step 3.9 gets
+  worse before it gets better, and the small classes are small.
+- **Confirms a Step 2/3 design choice**: boundary tests are what make most mutants detectable (only 15 of
+  169 escape).
+
+### 4.10 Tests and runtime
+
+15 tests in 13.5 s. They cover: references pass, infinite loop times out, exception = fail, syntax error =
+error, cache hit, bool/int strictness, "label with nothing to repair is rejected", and the
+mutate -> fail -> repair -> pass loop over every problem and class. Step 3's open question is answered: mutants
+really fail the tests and repairs really fix them.
+
+---
+
+<!-- Next entry: Step 5: generator.py (dataset + splits) -->

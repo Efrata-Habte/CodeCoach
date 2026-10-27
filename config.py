@@ -17,6 +17,9 @@ class Config:
     seed_fraction: float = 0.15           # share of train problems' samples that are labeled
     variants_per_problem: int = 12        # buggy variants generated per problem and class
 
+    # --- sandbox / verifier ----------------------------------------------
+    test_timeout_s: float = 2.0           # kill a candidate function that runs longer (infinite loops)
+
     # --- Level 0 gate (self-training) ------------------------------------
     min_delta: float = 0.005              # dev F1 must beat the best by this much
     max_class_drop: float = 0.10          # reject if any class F1 falls more than this
