@@ -768,4 +768,108 @@ influence decisions.
 
 ---
 
-<!-- Next entry: Step 7: Level 1, code editor / safety / archive / evaluator / evolve loop -->
+## Step 7a: The editing toolbox and the guard-rails (`code_editor.py`, `safety.py`)
+
+Files: `code_editor.py` (152 lines), `safety.py` (145 lines), `tests/test_code_editor.py`, `tests/test_safety.py`.
+Step 7 was split in two: 7a (this) builds the tools; 7b builds archive + evaluator + evolve loop.
+
+### 7a.1 Constrained program search instead of free-form code generation
+
+- **Decision**: the default proposer edits `evolvable/pipeline.py` with 5 fixed operators (`tweak_constant`,
+  `add_feature`, `remove_feature`, `change_layer`, `swap_curation`). Each parses the file, changes the tree,
+  and unparses it.
+- **Alternative**: let an LLM write the whole file (the optional proposer in Step 13).
+- **Why (intuition)**: think of a chef who may only choose from a fixed menu of ingredients and adjust
+  amounts, versus one who may improvise anything. Most menu combinations are valid dishes, so nearly every
+  child *runs* and the search spends its budget learning, not crashing. It needs no API key, is
+  reproducible, and every edit has a readable name. It is a small-scale version of what the Darwin Godel
+  Machine does with an LLM. The honest cost: it can only find improvements that live inside the menu.
+- **Evaluator might ask**: *"Is this really self-modifying code?"* Yes: the program's own source file is
+  rewritten and the rewritten program is what runs. It is bounded self-modification, not open-ended.
+
+### 7a.2 Bounds on every number
+
+- **Decision**: each tunable has a hard range (`LR` in [1e-4, 1e-2], `EPOCHS` in [5, 100], `MIN_DELTA` in
+  [0, 0.05], ...). Ints stay ints. Edits that would leave the range are clamped; no-ops return `None`.
+- **Why (intuition)**: without bounds one lucky multiplication gives `EPOCHS = 10**9` and the evaluator spends
+  the whole budget. A test applies 200 aggressive edits in a row and checks every value stays in range.
+- `NGRAM_RANGE` is kept ordered (`low <= high`); an edit that would break it is dropped.
+
+### 7a.3 A fixed menu of feature blocks
+
+- `add_feature` can only call blocks that exist in `feature_blocks.py` (8 of them); `remove_feature` never
+  removes the last one. So a "new feature" can never smuggle in file access, labels or test data: it is a
+  call to code we wrote and tested.
+
+### 7a.4 Edits drop comments (known cost)
+
+- `ast.unparse` removes comments and blank lines. Version v000 in the archive will therefore be stored in
+  normalized form (comment-free), so that diffs between versions show only the real edit. The original
+  commented `evolvable/pipeline.py` stays untouched in the repo. Demo diff: one changed line for one
+  `add_feature`.
+
+### 7a.5 One toolbox for both levels
+
+- The same module exposes `IMPROVER_OPERATORS` (`tweak_constant` on the improver's own knobs with
+  `IMPROVER_BOUNDS`, and `swap_parent_selection`). Level 2 will reuse the machinery, so "the improver edits
+  itself" needs no second implementation. `OPERATOR_WEIGHTS` is a dict, and its values are tunable too.
+
+### 7a.6 `safety.py`: four independent guard-rails
+
+| Guard | What it stops | Where it bites |
+|---|---|---|
+| Write whitelist (`assert_write_allowed`) | overwriting library/config/baseline | any write by the system must be under `archive/` (path tricks like `archive/../config.py` are resolved and refused) |
+| Static check (`check`) | forbidden imports and names, dunder escapes, code that runs at import, wrong interface | before a candidate is ever run |
+| Tamper detection (`protected_hashes`, `assert_unchanged`) | a candidate (or bug) changing the evaluator, data or tests | before/after every evaluation |
+| Isolated run (`run_isolated`) | infinite loops, runaway memory, crashes | the child is killed and the reason logged |
+
+**Why layers (intuition)**: any single wall can have a hole. The static check can miss a trick; so a timeout
+and memory cap still contain it; and if something still modified the evaluator, the hash check notices.
+Each layer assumes the one before it failed.
+
+### 7a.7 What the static check rejects (and why each rule exists)
+
+- Imports outside a per-file allow-list (pipeline: numpy, torch, torch.nn, random, math, the feature blocks;
+  improver: random, math, the editor).
+- Names for file/network/process/dynamic-code access (`open`, `exec`, `eval`, `__import__`, `os`, `sys`,
+  `subprocess`, `getattr`, `pickle`, ...), plus helpers hidden inside allowed libraries
+  (`torch.load`, `numpy.load`, `memmap`, `fromfile`, ...).
+- Our protected data: `splits`, `hidden_label`, `verdicts`, `verify`, `tests`, `PROBLEMS`: "no reference to
+  splits/labels/tests".
+- Any dunder attribute or name (blocks `().__class__.__bases__...` escapes).
+- Any statement at top level except imports, assignments, defs and a docstring: nothing may run on import.
+- Missing required functions/constants (`extra_features`, `build_teacher`, `curate`, `LR`, ...): a file
+  that breaks the interface is rejected *before* running, which saves evaluation time.
+- Source longer than 20,000 characters.
+
+### 7a.8 Honest limits of the guard-rails
+
+- **The static check is a filter, not a proof.** A determined adversary could look for gaps (that is why
+  there are three other layers). Our threat model is a *buggy or over-eager search procedure*, not a
+  malicious human.
+- Forbidding names also forbids innocent variables called `load`, `save`, `tests`, ... A mild cost,
+  accepted for simplicity.
+- Candidate code runs on the same machine as the user's files. A real deployment would add an OS-level
+  sandbox (container, no network).
+
+### 7a.9 The memory cap needed OS-specific code, and I checked it for real
+
+- **Decision**: Linux/macOS use `RLIMIT_AS`; Windows (this machine) uses a **Job Object** with a per-process
+  memory limit, via `ctypes`.
+- **Check (not just a green test)**: allocating 1500 MB under a 300 MB cap died with `MemoryError`
+  (`ok=False reason=crashed`), while a 100 MB control under the same cap succeeded. That rules out "the
+  test passed because the machine happened to fail".
+- The Linux/macOS branch is written but **not tested here** (no such machine). The documentation should say so.
+
+### 7a.10 Tests (41 new; 74 total in 42 s)
+
+Every operator: parseable, different, passes the safety check and actually **imports and runs**
+(`build_teacher`, `extra_features`) over 25 random seeds; bounds hold after 200 edits; layer count stays 1-4;
+add/remove feature behave; deterministic per seed; improver operators work on an improver-like file.
+Safety: baseline passes; each forbidden import/name/dunder/top-level-code/missing-interface/syntax/size case
+is rejected for the right reason; tamper detection fires for a changed, added or deleted file in every
+protected area; writes are limited to `archive/`; isolated runs return output, time out, and stop runaway memory.
+
+---
+
+<!-- Next entry: Step 7b: archive, evaluator, 02_evolve (Level 1 loop) -->
