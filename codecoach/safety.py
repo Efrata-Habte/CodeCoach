@@ -89,7 +89,7 @@ def check(source: str, kind: str = "pipeline") -> SafetyReport:
 
 def assert_write_allowed(path: Path) -> None:
     """The system may write only under archive/ (never over the fixed library or evolvable/)."""
-    if not Path(path).resolve().is_relative_to((ROOT / "archive").resolve()):
+    if not Path(path).resolve().is_relative_to((ROOT / "archive").resolve()):  # ROOT looked up at call time
         raise PermissionError(f"write outside archive/ refused: {path}")
 
 
@@ -152,15 +152,19 @@ def _limit_memory_windows(proc: subprocess.Popen, memory_mb: int) -> None:
 
 
 def run_isolated(args: list[str], timeout_s: float, memory_mb: int, stdin: str = "") -> IsolatedResult:
-    """Run `python -I <args>` as a child with a time limit and a memory cap; kill it if it misbehaves."""
+    """Run `python -E -P <args>` as a child with a time limit and a memory cap; kill it if it misbehaves.
+
+    -E ignores PYTHON* env vars and -P keeps the current directory off the import path (a planted
+    json.py cannot hijack us). We do NOT use -I here: it also hides user site-packages, where torch lives.
+    """
     pre = None
     if sys.platform != "win32":  # Linux/macOS: address-space limit applied in the child before it starts
         import resource
         pre = lambda: resource.setrlimit(resource.RLIMIT_AS, (memory_mb << 20, memory_mb << 20))  # noqa: E731
-    proc = subprocess.Popen([sys.executable, "-I", *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, preexec_fn=pre) if pre else \
-        subprocess.Popen([sys.executable, "-I", *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True)
+    cmd = [sys.executable, "-E", "-P", *args]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, preexec_fn=pre) if pre else \
+        subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if sys.platform == "win32":
         _limit_memory_windows(proc, memory_mb)
     try:

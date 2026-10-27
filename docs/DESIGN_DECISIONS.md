@@ -872,4 +872,131 @@ protected area; writes are limited to `archive/`; isolated runs return output, t
 
 ---
 
-<!-- Next entry: Step 7b: archive, evaluator, 02_evolve (Level 1 loop) -->
+## Step 7b: Archive, evaluator and the Level 1 loop (`archive.py`, `evaluator.py`, `02_evolve.py`, `improver.py` v0)
+
+Files: `archive.py` (90 lines), `evaluator.py` (79), `scripts/02_evolve.py` (92), `evolvable/improver.py` (41),
+`tests/test_archive_evolve.py` (12 tests). Suite: 86 tests, 54 s.
+
+### 7b.1 The archive is a tree of versions, not a single "current" file
+
+- **Decision**: every candidate gets an id (`v000`, `v001`, ...), a parent, the edit that produced it, its metrics,
+  an accepted flag and a reason. Rejected versions are **kept** (source + metrics), flagged.
+- **Alternative**: keep only the current best and overwrite it (hill climbing).
+- **Why (intuition)**: Darwin-Godel-Machine thinking: a mediocre version today might be the stepping stone to a
+  great one tomorrow, so any accepted version can be a parent. Keeping rejected versions is what makes the failure
+  analysis possible later ("which kinds of edits never helped?"). Weights (`model.pt`) are stored only for accepted
+  versions; rejected ones are too many and too useless to keep.
+- Writes go through `assert_write_allowed`; the index is written to a temp file and renamed so a crash can never
+  leave a half-written `index.json`.
+
+### 7b.2 The evaluator treats the system's own code as untrusted
+
+- **Decision**: a candidate is written to `archive/_tmp/`, imported and run inside an **isolated child** (timeout, memory
+  cap), and every protected file is hashed before and after. A change raises `TamperError`, which the loop does **not**
+  catch: the whole run aborts.
+- **Why (intuition)**: the thing being evaluated wrote its own code. The evaluator is the one place that must not trust
+  it. A crash or hang costs one generation; tampering ends the experiment, because after tampering no number can be trusted.
+- The child reports one `@@RESULT@@` JSON line; the candidate's `print()` output is diverted to stderr so it cannot forge
+  or corrupt the result.
+- It returns **dev** F1 (decides pipeline acceptance) and **meta_dev** F1 (only for judging improvers in Level 2). **`test`
+  is never touched here.**
+
+### 7b.3 Bug found by running it: `python -I` hides your packages
+
+- The sandbox from Step 4 uses `python -I`. For the evaluator the child died instantly: `No module named 'torch'`. `-I`
+  also disables *user* site-packages, where torch lives; Step 4 never noticed because it needed only the standard library.
+- **Fix**: `run_isolated` now uses `-E -P` (ignore `PYTHON*` env vars; keep the current directory off the import path).
+  That keeps the protection we wanted (no planted `json.py`) without hiding installed packages.
+- **Lesson**: a safety flag can silently remove something the code depends on. Always run the real thing once.
+- **Verification that isolation changes nothing**: the isolated baseline gave dev 0.394 (0.211 initially), the same as the
+  in-process run in Step 6, in 5.5 s.
+
+### 7b.4 Failure is a normal outcome with a name
+
+- Rejection reasons recorded per version: `unsafe: ...` (never run), `duplicate` (same code as an earlier version, not
+  re-evaluated), `crash`, `timeout`, `memory`, `no_improvement`. All three runtime failures were tested **for real** (a
+  `1/0`, a `[0] * 10**11`, a `while True`) and each is contained and correctly named.
+- Duplicates are skipped because evaluation is the expensive step; they still use up a generation, so the budget stays
+  honest and the loop always terminates.
+- **Test-writing lesson**: one of my tests silently evaluated the *unmodified* baseline, because `ast.unparse` writes
+  `layers, width = ([], input_dim)` (with parentheses) and my `.replace` matched nothing. It "failed" in a confusing way
+  (the evaluator said OK). Every replace-based test now asserts that the text really changed.
+
+### 7b.5 The gate compares a child with its PARENT
+
+- **Decision**: accept if `dev_f1(child) >= dev_f1(parent) + min_delta` (0.005), where the parent is whichever accepted
+  version the improver picked, not the global best.
+- **Why (intuition)**: it measures what the edit did. Comparing to the global best would reject useful edits of weaker
+  lineages that the archive wants to keep exploring. Cost: a chain of small noisy "wins" can drift upward (see 7b.7).
+
+### 7b.6 `improver.py` v0 (written now, edited by itself in Step 8)
+
+- Holds `OPERATOR_WEIGHTS`, `EDITS_PER_CHILD`, `PARENT_SELECTION`, `TOURNAMENT_K`, `STEP_SCALE` and three functions:
+  `choose_parent`, `propose_child` (used now) and `propose_self_edit` (used by Level 2 next step).
+- Tournament selection (best of K random accepted versions) = pressure toward good parents with some exploration.
+- It receives the archive as plain dicts (`id`, `dev_f1`, `order`), not objects: the improver file gets only what it needs.
+- It passes the same static check (`kind="improver"`). It runs in the main process, which is acceptable only because every
+  Level 2 edit is a constrained change to constants/strings (Step 7a), never new logic.
+
+### 7b.7 REAL RESULT: first `--quick` run (6 generations, seed 0)
+
+| Version | Parent | Edit | Dev F1 | Meta-dev F1 | Decision |
+|---|---|---|---|---|---|
+| v000 | | baseline | 0.394 | 0.536 | baseline |
+| v001 | v000 | `change_layer [256,128] -> [128]` | 0.077 | | rejected: no_improvement |
+| v002 | v000 | `swap_curation dedup_cap -> balance` | 0.376 | | rejected: no_improvement |
+| v003 | v000 | same edit as v002 | | | rejected: duplicate |
+| v004 | v000 | `add_feature count_const_assigns` | 0.434 | **0.408** | accepted |
+| v005 | v004 | `EPOCHS 30 -> 43` | 0.438 | | rejected: no_improvement |
+| v006 | v004 | `EPOCHS 30 -> 39` | 0.465 | 0.550 | accepted |
+
+Diff of the system's rewrite of its own source, v000 to v006: `EPOCHS = 30` becomes `39`, and a fourth feature
+`fb.count_const_assigns(code)` is appended to `extra_features`.
+
+**How to read it honestly (do not oversell):**
+- The pipeline's dev F1 rose **0.394 -> 0.465 (+0.071)**, but meta_dev rose only **0.536 -> 0.550 (+0.014)**. The dev gain
+  is mostly selection on dev (and noise); meta_dev, which nothing chose on, shows almost nothing.
+- **v004 gained +0.040 on dev but lost 0.128 on meta_dev** (0.536 -> 0.408). An accepted version that is *worse* on held-out
+  data is the textbook symptom of selecting on a small, noisy dev set. This is exactly why meta_dev exists, and the reason
+  gains must be confirmed on data the search never used (test, more seeds).
+- `WRONG_INITIAL_VALUE` stays at F1 = 0 on both splits even though `count_const_assigns` was added with it in mind;
+  `COMPARISON_BOUNDARY` is 0 on meta_dev. The blind spot from Step 6 is not fixed by this run.
+- v001 (one hidden layer) scores 0.077 on dev: with so little data, small architecture changes can swing results wildly. That
+  is the noise level the gate has to live with.
+- Six generations, one seed, one run: this proves the **machinery works**, not that self-editing helps. The full run (20
+  generations), the ablation and extra seeds come later.
+
+### 7b.8 Known limitations of this step
+
+- One seed per evaluation: parent and child are compared on a single training run, so some accepted edits are just seed luck.
+  Plan: re-evaluate the baseline and the best version on extra seeds and report the mean (not used for selection).
+- Comments are dropped by `ast.unparse` (v000 in the archive is the comment-free form).
+- Linux/macOS memory cap still untested (see 7a.9).
+- The Level 1 loop runs sequentially (about 6 s per evaluation); parallel evaluation would be faster but harder to follow.
+
+---
+
+## Demo requirement added after Step 7 (decided with the user)
+
+The presentation must show learning **happening**, not only saved results. Chosen: **both** live-learning modes, and
+**live distillation**.
+
+| Live feature | What the audience sees | What it needs from the library |
+|---|---|---|
+| Learn from my snippet (Try-it page) | paste a bug -> prediction -> verifier check -> retrain in seconds -> before/after prediction + gate decision | a function that adds one verified example and retrains/gates; fast (a Level 0 training takes about 1 s) |
+| Live run (Run button) | rounds stream in: accepted vs rejected pseudo-labels, dev F1, rollbacks | `self_train` must report each round through a callback instead of only returning at the end |
+| Live distillation | tiny student trained from the teacher in seconds, live loss curve, then F1 / size / latency vs hard-label student | distillation training with a progress callback, fast enough for a laptop on stage |
+
+Decisions already visible, to be settled when the app is built (Step 11):
+- **One example rarely moves dev F1 by `min_delta`.** A strict gate will almost always roll back a single-snippet update.
+  Options: collect a few verified snippets in a session buffer and retrain when it reaches k, or show the before/after
+  prediction on the SAME snippet next to the (honest) gate verdict. Do not weaken the real gate to make the demo look good.
+- The full 3-seed distillation table stays precomputed. The live student is a demonstration, a single run; it must say so on screen.
+- Live runs use quick mode so they finish in 1-3 minutes.
+
+Plan impact: Step 8 (Level 2) unchanged; Steps 8-10 add progress callbacks; Step 11 gets a "Live" page.
+
+---
+
+<!-- Next entry: Step 8: Level 2, the improver improves itself -->
+
