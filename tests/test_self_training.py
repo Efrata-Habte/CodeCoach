@@ -80,6 +80,12 @@ def test_impossible_gate_means_rollback_and_early_stop(splits) -> None:
     assert r.n_verified == 0 and r.final_dev == r.initial_dev            # nothing was promoted
 
 
+def test_on_round_callback_receives_every_round_as_it_ends(splits) -> None:
+    seen: list = []
+    r = self_train(_pipe(SELF_TRAIN_ROUNDS=2), splits, Config(), seed=0, on_round=seen.append)
+    assert seen == r.rounds and len(seen) >= 1  # the live demo draws charts from exactly these dicts
+
+
 def test_loop_never_reads_hidden_labels(splits) -> None:
     # Scramble every hidden label. Only the *logged* statistics may change, never a decision.
     scrambled = Splits(splits.seed, [PoolSample(p.code, p.problem, "SCRAMBLED") for p in splits.pool],

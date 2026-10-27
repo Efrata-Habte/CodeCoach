@@ -19,8 +19,9 @@ Result = tuple[str, str] | None
 PIPELINE_BOUNDS = {"LR": (1e-4, 1e-2), "EPOCHS": (5, 100), "DROPOUT": (0.0, 0.6),
                    "MAX_FEATURES": (256, 8192), "SELF_TRAIN_ROUNDS": (1, 8), "POOL_PER_ROUND": (50, 600),
                    "MIN_DELTA": (0.0, 0.05), "PER_CLASS_CAP": (5, 100), "NGRAM_RANGE": (1, 6)}
-IMPROVER_BOUNDS = {"EDITS_PER_CHILD": (1, 3), "TOURNAMENT_K": (2, 6), "STEP_SCALE": (0.05, 0.8),
-                   "OPERATOR_WEIGHTS": (0.05, 3.0)}
+# Only knobs that change what propose_child() does: Level 2 judges an improver by the children it proposes
+# from a FIXED parent, so TOURNAMENT_K / PARENT_SELECTION (used by choose_parent) cannot be judged and are not tuned.
+IMPROVER_BOUNDS = {"EDITS_PER_CHILD": (1, 3), "STEP_SCALE": (0.05, 0.8), "OPERATOR_WEIGHTS": (0.05, 3.0)}
 CURATION_CHOICES = ("none", "dedup_cap", "balance")
 PARENT_CHOICES = ("tournament", "best", "recent")
 LAYER_SIZES = (16, 32, 64, 128, 256, 512)
@@ -184,5 +185,5 @@ Operator = Callable[[str, random.Random, float], Result]
 PIPELINE_OPERATORS: dict[str, Operator] = {
     "tweak_constant": tweak_constant, "add_feature": add_feature, "remove_feature": remove_feature,
     "change_layer": change_layer, "swap_curation": swap_curation}
-IMPROVER_OPERATORS: dict[str, Operator] = {
-    "tweak_constant": tweak_improver_constant, "swap_parent_selection": swap_parent_selection}
+# swap_parent_selection exists above but is deliberately NOT offered: its effect is invisible to the Level 2 utility.
+IMPROVER_OPERATORS: dict[str, Operator] = {"tweak_constant": tweak_improver_constant}

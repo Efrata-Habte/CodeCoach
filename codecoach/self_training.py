@@ -10,6 +10,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from types import ModuleType
+from typing import Callable
 
 from config import Config
 from codecoach.generator import PoolSample, Splits, normalized_problem
@@ -81,8 +82,13 @@ def _mean(flags: list[bool]) -> float | None:
 
 
 def self_train(pipe: ModuleType, splits: Splits, cfg: Config, seed: int = 0,
-               verdicts: dict[str, str] | None = None) -> SelfTrainResult:
-    """Run Level 0 with the settings in `pipe`. Reads only `.code` of pool items while looping."""
+               verdicts: dict[str, str] | None = None,
+               on_round: Callable[[dict], None] | None = None) -> SelfTrainResult:
+    """Run Level 0 with the settings in `pipe`. Reads only `.code` of pool items while looping.
+
+    `on_round` (optional) receives each round's log dict the moment the round ends: the live demo
+    uses it to draw charts while training is still running.
+    """
     start, rng, verdicts = time.time(), random.Random(seed), verdicts or {}
     featurizer = Featurizer(pipe).fit([s.code for s in splits.seed] + [p.code for p in splits.pool])
     seed_ex = [(s.code, s.label) for s in splits.seed]
@@ -122,6 +128,8 @@ def self_train(pipe: ModuleType, splits: Splits, cfg: Config, seed: int = 0,
             bad_rounds += 1                                          # rollback: old teacher was never touched
         logs.append({**log, "decision": "accepted" if ok else "rejected", "reason": why,
                      "best_dev_f1": best["macro_f1"]})
-        if bad_rounds >= cfg.max_bad_rounds:                         # stop rule: no budget wasted on a stuck loop
+        if on_round:
+            on_round(logs[-1])
+        if bad_rounds >= cfg.max_bad_rounds:                        # stop rule: no budget wasted on a stuck loop
             break
     return SelfTrainResult(teacher, logs, initial, best, len(accepted_ex), time.time() - start)

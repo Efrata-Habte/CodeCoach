@@ -91,11 +91,18 @@ def test_edits_are_deterministic_for_a_seed() -> None:
 def test_improver_operators_work_on_an_improver_like_file() -> None:
     src = ('OPERATOR_WEIGHTS = {"tweak_constant": 1.0, "add_feature": 1.0}\nEDITS_PER_CHILD = 1\n'
            'PARENT_SELECTION = "tournament"\nTOURNAMENT_K = 3\nSTEP_SCALE = 0.3\n')
-    seen = set()
-    for seed in range(40):
+    touched = set()
+    for seed in range(60):
         for op in ce.IMPROVER_OPERATORS.values():
             res = op(src, random.Random(seed), 0.3)
             if res:
-                seen.add(res[1].split(":")[0])
                 assert res[0] != ce.normalize_source(src)
-    assert seen == {"tweak_constant", "swap_parent_selection"}
+                touched.add(res[1].split(": ")[1].split("[")[0].split(" ")[0])
+    assert set(ce.IMPROVER_OPERATORS) == {"tweak_constant"}  # parent-selection edits are not offered (unjudgeable)
+    assert touched == {"OPERATOR_WEIGHTS", "EDITS_PER_CHILD", "STEP_SCALE"}  # never TOURNAMENT_K
+
+
+def test_swap_parent_selection_still_exists_as_an_operator() -> None:
+    src = 'PARENT_SELECTION = "tournament"\n'
+    new, desc = ce.swap_parent_selection(src, random.Random(0), 0.3)
+    assert desc.startswith("swap_parent_selection") and new != ce.normalize_source(src)

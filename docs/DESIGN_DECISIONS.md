@@ -998,5 +998,114 @@ Plan impact: Step 8 (Level 2) unchanged; Steps 8-10 add progress callbacks; Step
 
 ---
 
-<!-- Next entry: Step 8: Level 2, the improver improves itself -->
+## Step 8: Level 2, the improver improves itself (`scripts/02_evolve.py`: `Level2` class)
+
+Files: `scripts/02_evolve.py` (188 lines; now Level 1 + Level 2), `self_training.py` (+ `on_round` callback),
+`tests/test_archive_evolve.py` (+6 Level 2 tests), `tests/test_self_training.py` (+1). Suite: 93 tests.
+New flags: `--no-level2` (the ablation), `--tag NAME` (separate archive folder `archive/NAME/` for ablation runs).
+
+### 8.1 What "the improver improves itself" means here (and what it does not)
+
+- The improver is a source file (`evolvable/improver.py`). `propose_self_edit` returns an edited copy of that same
+  file (changing `STEP_SCALE`, `OPERATOR_WEIGHTS`, `EDITS_PER_CHILD`, `TOURNAMENT_K`, `PARENT_SELECTION`). If the copy
+  proves better, the loop starts using it for all later proposals.
+- This is **bounded** self-modification: the edit space is a few constants and one string choice, never new logic.
+  Say "bounded, sandboxed recursive self-improvement", not "recursive self-improvement".
+- **Evaluator might ask**: *"Is this STOP?"* Same structure as Zelikman et al.: an improver is judged by how well the
+  programs it produces turn out (its *utility*), and the improver is only replaced by a better one. Difference: STOP's
+  improver is an LLM program with open-ended rewrites; ours edits constants.
+
+### 8.2 How "better improver" is measured (utility), and why this way
+
+1. Fix one parent: the best accepted pipeline at that moment.
+2. The OLD and the NEW improver each propose `B` children from that same parent, with the same random seed.
+3. Each child is evaluated by the fixed evaluator.
+4. A child is worth **its meta_dev gain, but only if it would have passed the Level 1 dev gate; otherwise 0**.
+   `utility = mean over the B children`.
+5. Accept the new improver only if `utility_new > utility_old + min_delta`; otherwise roll back to the old one.
+
+- **Why meta_dev gain, gated by dev** (intuition): in Level 1 an edit survives only if dev says yes. What the improver
+  should be paid for is what a surviving edit is *really* worth on data the pipeline was never selected on. This pays for
+  genuine improvement and **penalises overfitting edits**: v004 in Step 7b gained +0.040 on dev but lost 0.128 on
+  meta_dev, so it would have scored *negative*. Paying on dev would reward exactly the edits that fool the gate.
+- **Why failures count as 0** (not as a penalty): in the real loop a crashed, unsafe, duplicate or rejected child
+  contributes nothing, so 0 is its true value.
+- **Why same parent and same seeds** (intuition): a fair race needs the same track. Otherwise an improver could win just
+  because it got an easier parent or a luckier random draw.
+- This departs slightly from "mean dev-F1 gain": spec wording was ambiguous; I chose the definition above and say so.
+
+### 8.3 Why meta_dev, not dev, for Level 2 (answer to a likely question)
+
+The pipeline was selected on dev, so dev scores are optimistic by construction. If the improver were also judged on dev, it
+would learn to propose edits that exploit the dev set's noise. meta_dev is touched only by Level 2, never by a pipeline
+acceptance decision, so it is the first honest signal available during the run. `test` stays untouched until the end.
+
+### 8.4 FINDING 1: a blind spot in the measurement (found by reading the archive, not by a failing test)
+
+First `--quick` run: the improver proposed `swap_parent_selection: tournament -> best` (and later `-> recent`). Both times
+utility was **+0.000 for old and new**, and the probe lists were **identical**.
+- Cause: probes start from a *fixed* parent, so `choose_parent()` is never called. An improver that differs only in
+  `PARENT_SELECTION` or `TOURNAMENT_K` produces exactly the same probes. Acceptance needs `>`, so such an edit can **never** win.
+- Effect: 2 of the improver's 5 knobs (parent selection, tournament size) are *unjudgeable* under this protocol. Every check
+  spent on them costs `2B` pipeline evaluations (about 25-40 s) for a certain rejection.
+- It is documented by a test (`test_parent_selection_edits_are_invisible_to_the_utility_measure`) so it cannot be forgotten
+  or silently "fixed".
+- Options were: keep the spec and document; remove those edits from the Level 2 menu so no budget is wasted; or let probes
+  choose their parent through `choose_parent` (parent selection matters, but the comparison is less controlled).
+- **Decision (user): drop them from the menu.** `IMPROVER_OPERATORS` now offers only `tweak_constant`, restricted to
+  `OPERATOR_WEIGHTS`, `EDITS_PER_CHILD` and `STEP_SCALE` (`TOURNAMENT_K` left `IMPROVER_BOUNDS`). `swap_parent_selection`
+  remains in `code_editor.py` (and is tested) but is not offered. `PARENT_SELECTION` / `TOURNAMENT_K` stay in the file and
+  still drive Level 1, they just are not tuned by Level 2. Cost: a smaller search space; benefit: no certain-rejection checks.
+
+### 8.5 FINDING 2: the utility signal is sparse, so expect ties
+
+Only 2 of the 6 pipeline edits in the quick run passed the dev gate (about 1 in 3). With `B = 2` (quick) or `B = 3` (default),
+each improver's utility is often exactly 0, so utility ties and the new improver is rejected (`>` is strict). Even when edits are
+kept, their meta_dev gains are noisy (v004: -0.128). Honest expectation for the full run: **Level 2 is more likely to
+produce a null result than a measurable gain**. A rigorous null result is acceptable; tuning `B` or the threshold until the
+improver "wins" is not.
+
+### 8.6 What was verified
+
+| Property | Evidence |
+|---|---|
+| A better improver is accepted and used afterwards | test: an improver proposing only `add_feature` edits (which the fake evaluator rewards) beats the default; archive record has both utilities and all probes |
+| A worse improver is rolled back | test: only `remove_feature` edits -> all probe gains 0 -> rejected, `level2.id` stays `improver_v000` |
+| Unsafe / duplicate / missing self-edits cost nothing | test: `import os` -> `unsafe`, same source -> `duplicate`, `None` -> `no_edit`; **zero** pipeline evaluations |
+| Level 2 cannot disturb Level 1 | test: with a Level 2 that always rejects, the pipeline trajectory is identical to a run without Level 2 (it uses its own random numbers). This also makes the ablation a clean paired comparison |
+| Real run reproduces Level 1 | the second `--quick` run produced exactly the same v004 and v006 as Step 7b |
+| Events stream | `on_event` (loop) and `on_round` (self-training) deliver each record as it happens, for the live demo |
+
+### 8.7 REAL RESULTS: two `--quick` runs (6 generations, Level 2 every 3, B = 2)
+
+Level 1 was identical in both and to Step 7b (v000 dev 0.394 -> v006 0.465; meta_dev 0.536 -> 0.550).
+
+| Run | Level 2 proposals | Utility old / new | Outcome |
+|---|---|---|---|
+| Before the menu change | `swap_parent_selection -> best`, `-> recent` | 0.000 / 0.000 | rejected (blind spot, 8.4) |
+| After the menu change | `OPERATOR_WEIGHTS[remove_feature] 0.5 -> 0.37`, `OPERATOR_WEIGHTS[add_feature] 1.0 -> 1.16` | 0.000 / 0.000 | rejected |
+
+**Why the second run still tied (FINDING 3: resolution).** The probes were again **identical** for old and new improver.
+Both improvers draw from the same random stream (that is what makes the race fair), and a 16-26% change to one operator
+weight rarely changes WHICH operator is drawn in only 2 draws. Same children -> same scores -> exact tie. In addition,
+none of the probe children passed the dev gate at all (all `no_improvement`), so even different children would have scored 0.
+Net: at quick scale (`B = 2`) Level 2 **cannot discriminate** between improvers whose settings differ slightly. This is a
+property of the measurement's resolution, not a bug; it will matter for the full run (`B = 3`, 20 generations), where a
+tie is still the most likely outcome.
+
+What this run does show: the mechanism works end to end (proposal, static check, import, two paired races through the
+sandboxed evaluator, gate, archive record, rollback). What it does NOT show: that self-editing the improver helps (or hurts).
+
+### 8.8 Extra housekeeping
+
+- **Test-suite time**: 93 tests take 54-140 s depending on machine load (the suite spawns about 250 child processes; Windows
+  Defender and other apps change the timing a lot). The "under 60 s" target is therefore **not reliable on this machine**.
+  A trial to shave the slowest test made things worse (the shared sandbox cache was warming other tests), so it was reverted.
+- Improver edits run in the main process (after the static check), which is acceptable only because the edit space is
+  constants and strings.
+
+---
+
+<!-- Next entry: Step 9: distillation + figures -->
+
 

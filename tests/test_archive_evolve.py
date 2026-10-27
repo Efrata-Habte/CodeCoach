@@ -1,8 +1,10 @@
 """Archive round-trip, the Level 1 loop (with a fake evaluator), and the real isolated evaluator."""
+import ast
 import importlib.util
 import random
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -156,6 +158,102 @@ def test_tamper_error_aborts_the_run(sandboxed_archive) -> None:
     with pytest.raises(safety.TamperError):
         _load_script().run_level1(replace(Config(), generations=3), sandboxed_archive, improver, tampered,
                                   random.Random(0), log=lambda s: None)
+
+
+# ---- Level 2: the improver edits itself --------------------------------------------------------------------------
+IMPROVER_SRC = normalize_source((ROOT / "evolvable" / "improver.py").read_text(encoding="utf-8"))
+
+
+def _improver_with(weights: dict | None = None, **constants) -> str:
+    """The real improver source with some module-level constants replaced (via the AST, like the editor does)."""
+    tree = ast.parse(IMPROVER_SRC)
+    new = ({"OPERATOR_WEIGHTS": weights} if weights else {}) | constants
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and stmt.targets[0].id in new:
+            stmt.value = ast.parse(repr(new[stmt.targets[0].id]), mode="eval").body
+    out = ast.unparse(tree)
+    assert out != IMPROVER_SRC, "nothing was replaced"
+    return out
+
+
+def _level2_setup(arch: Archive, proposal, cfg=None, evaluate=None):
+    """Archive with v000 + improver_v000, a Level2 object, and a stand-in improver whose self-edit is `proposal`."""
+    script = _load_script()
+    _baseline(arch)
+    arch.add(Version("improver_v000", "improver", None, "baseline", "baseline", True, "baseline", 0), IMPROVER_SRC)
+    cfg = cfg or replace(Config(), improver_budget=3)
+    calls = []
+    fn = evaluate or _fake_eval
+    level2 = script.Level2(cfg, arch, lambda s: calls.append(s) or fn(s), log=lambda s: None)
+    old = SimpleNamespace(choose_parent=improver.choose_parent, propose_child=improver.propose_child,
+                          propose_self_edit=lambda src, rng: proposal)
+    return level2, old, calls
+
+
+def test_level2_accepts_an_improver_whose_edits_are_worth_more(sandboxed_archive) -> None:
+    better = _improver_with({"add_feature": 1.0})  # only proposes edits the fake evaluator rewards
+    level2, old, _ = _level2_setup(sandboxed_archive, (better, "weights: add_feature only"))
+    new = level2(3, old)
+    rec = sandboxed_archive.get("improver_v001")
+    assert rec.accepted and rec.parent_id == "improver_v000" and new is not old
+    assert rec.metrics["utility"] > rec.metrics["utility_old"] + Config().min_delta
+    assert len(rec.metrics["probes"]) == len(rec.metrics["probes_old"]) == 3
+    assert level2.id == "improver_v001" and "add_feature" in sandboxed_archive.source("improver_v001")
+
+
+def test_level2_rejects_a_worse_improver_and_keeps_the_old_one(sandboxed_archive) -> None:
+    worse = _improver_with({"remove_feature": 1.0})  # every edit removes a feature -> never passes the dev gate
+    level2, old, _ = _level2_setup(sandboxed_archive, (worse, "weights: remove_feature only"))
+    assert level2(3, old) is old
+    rec = sandboxed_archive.get("improver_v001")
+    assert not rec.accepted and rec.reason == "no_improvement" and level2.id == "improver_v000"
+    assert [p["gain"] for p in rec.metrics["probes"]] == [0.0, 0.0, 0.0]
+
+
+def test_level2_rejects_unsafe_duplicate_and_missing_self_edits_without_evaluating(sandboxed_archive) -> None:
+    arch = sandboxed_archive
+    level2, old, calls = _level2_setup(arch, ("import os\n" + IMPROVER_SRC, "evil"))
+    level2(3, old)
+    old.propose_self_edit = lambda src, rng: (IMPROVER_SRC, "no-op")
+    level2(6, old)
+    old.propose_self_edit = lambda src, rng: None
+    level2(9, old)
+    assert [v.reason.split(":")[0] for v in arch.versions if v.kind == "improver"][1:] == ["unsafe", "duplicate", "no_edit"]
+    assert calls == []  # none of them cost a single pipeline evaluation
+
+
+def test_parent_selection_edits_are_invisible_to_the_utility_measure(sandboxed_archive) -> None:
+    # KNOWN LIMITATION (see DESIGN_DECISIONS 8.4): probes start from a FIXED parent, so choose_parent never runs.
+    # An improver differing only in PARENT_SELECTION / TOURNAMENT_K gets exactly the same utility and cannot win.
+    level2, old, _ = _level2_setup(sandboxed_archive, (_improver_with(PARENT_SELECTION="best", TOURNAMENT_K=5), "parent sel."))
+    level2(3, old)
+    rec = sandboxed_archive.get("improver_v001")
+    assert rec.metrics["utility"] == rec.metrics["utility_old"] and not rec.accepted
+
+
+def test_rejected_level2_steps_do_not_disturb_level1(tmp_path, monkeypatch) -> None:
+    runs = []
+    for name, with_l2 in (("plain", False), ("with_l2", True)):
+        monkeypatch.setattr(safety, "ROOT", tmp_path / name)
+        monkeypatch.setattr(archive_mod, "ROOT", tmp_path / name)
+        arch = Archive(tmp_path / name / "archive")
+        level2, old, _ = _level2_setup(arch, None)  # always "no_edit"
+        _load_script().run_level1(replace(Config(), generations=8, patience=100, improver_every=2), arch, improver,
+                                  _fake_eval, random.Random(4), log=lambda s: None, level2=level2 if with_l2 else None)
+        runs.append([(v.edit, v.reason) for v in arch.versions if v.kind == "pipeline"])
+    assert runs[0] == runs[1]  # same pipeline trajectory: Level 2 uses its own random numbers
+
+
+def test_on_event_streams_every_version_and_summary_works(sandboxed_archive) -> None:
+    arch, events = sandboxed_archive, []
+    level2, old, _ = _level2_setup(arch, (_improver_with({"add_feature": 1.0}), "weights"))
+    script = _load_script()
+    level2.on_event = events.append
+    script.run_level1(replace(Config(), generations=4, patience=100, improver_every=2), arch, improver, _fake_eval,
+                      random.Random(1), log=lambda s: None, level2=level2, on_event=events.append)
+    assert [e["type"] for e in events].count("pipeline") == 4 and any(e["type"] == "improver" for e in events)
+    s = script.summarize(arch)
+    assert s["n_generations"] == 4 and s["improver_proposals"] >= 1 and s["final_improver_id"].startswith("improver_v")
 
 
 # ---- the real evaluator (isolated child process) ------------------------------------------------------------
